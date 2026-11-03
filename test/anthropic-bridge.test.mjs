@@ -113,8 +113,9 @@ describe('anthropic-chat-bridge', () => {
   });
 
   async function setup(opts) {
-    const upstream = await startFakeUpstream(opts);
-    const bridge = await startBridge(upstream.port);
+    const { env, ...upstreamOpts } = opts ?? {};
+    const upstream = await startFakeUpstream(upstreamOpts);
+    const bridge = await startBridge(upstream.port, env);
     cleanups.push(() => { bridge.child.kill(); upstream.server.close(); });
     return { upstream, bridge };
   }
@@ -357,14 +358,58 @@ describe('anthropic-chat-bridge', () => {
       ],
     });
     const body = await (await fetch(`${bridge.baseURL}/v1/models`)).json();
-    // Desktop derives "1M" from `max_input_tokens >= 1e6` and substitutes its
-    // own 200 000 default when the row omits the field — silently capping every
-    // model. The number therefore has to survive the translation.
+    // Desktop derives the window from `max_input_tokens` and substitutes its own
+    // 200 000 default when the row omits the field — silently capping every model.
     const byLabel = Object.fromEntries(body.data.map((m) => [m.display_name, m]));
     assert.equal(byLabel['CN · Big'].max_input_tokens, 1_000_000);
-    assert.equal(byLabel['CN · Big'].prefer_1m, true);
     assert.equal(byLabel['CN · Small'].max_input_tokens, 200_000);
-    assert.equal(byLabel['CN · Small'].prefer_1m, undefined);
+    // `prefer_1m`/`supports_1m` stay off on purpose: advertising them makes Desktop
+    // rewrite the session model id to `<id>[1m]`, which the picker renders as a
+    // "1M" suffix after the name. The pin below gets 1M from an id Claude Code
+    // already knows, with no suffix.
+    for (const m of body.data) {
+      assert.equal(m.prefer_1m, undefined);
+      assert.equal(m.supports_1m, undefined);
+    }
+  });
+
+  it('pins the Claude-facing catalog to one native 1M model id', async () => {
+    const { bridge, upstream } = await setup({
+      env: { ANB_MODEL_ALLOWLIST: 'cn:deepseek-v4.1-flash' },
+      models: [
+        {
+          id: 'cn:deepseek-v4.1-flash',
+          name: 'DeepSeek V4.1 Flash',
+          context_length: 1_000_000,
+          reasoning_supported_efforts: ['low', 'high', 'max'],
+        },
+        { id: 'cn:hy3', name: 'Hy3' },
+      ],
+    });
+    const body = await (await fetch(`${bridge.baseURL}/v1/models`)).json();
+    assert.equal(body.data.length, 1);
+    const row = body.data[0];
+    // `claude-opus-5-5` is the one id Claude Code recognises as a native 1M model
+    // without the `[1m]` tag — and the tag is exactly what the picker renders as a
+    // "1M" suffix. Measured on claude 2.1.309: an unknown id reports contextWindow
+    // 200 000 even with CLAUDE_CODE_MAX_CONTEXT_TOKENS set, while `claude-opus-5-5`
+    // reports 1 000 000.
+    assert.equal(row.id, 'claude-opus-5-5');
+    assert.equal(row.display_name, 'Opus 5.5');
+    assert.equal(row.max_input_tokens, 1_000_000);
+    assert.equal(row.max_effort_level, 'max');
+    assert.equal(row.prefer_1m, undefined);
+    assert.equal(row.supports_1m, undefined);
+
+    const r = await post(bridge.baseURL, '/v1/messages', {
+      model: 'claude-opus-5-5',
+      max_tokens: 8,
+      messages: [{ role: 'user', content: 'hi' }],
+      stream: true,
+    });
+    assert.equal(r.status, 200);
+    // The picker-facing id must still resolve to the pinned gateway model.
+    assert.equal(upstream.seen.at(-1).body.model, 'cn:deepseek-v4.1-flash');
   });
 
   it('advertises the top effort and a Claude family so the selector renders', async () => {

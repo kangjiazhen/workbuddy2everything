@@ -103,4 +103,4 @@
           apiKey: ''
           # Used only when a client names a bare Claude alias (claude-sonnet-5-5,
           # opus). Empty = the first model in the gateway catalog.
-          defaultModel: ''
+          defaultModel: cn:deepseek-v4.1-flash

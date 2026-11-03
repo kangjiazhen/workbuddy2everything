@@ -146,6 +146,28 @@ function capture(kind, payload) {
 const ANON_PREFIX = 'claude-wb-';
 const ANON_RE = /^claude-wb-[0-9a-f]{6,}$/i;
 
+/* ------------------------------------------------------------------ */
+/* local pin (2026-11-03)                                             */
+/* ------------------------------------------------------------------ */
+// 本机诉求：Claude 侧的模型目录只投影一个目标模型，且任何裸 Claude alias
+// （opus / sonnet / haiku / claude-sonnet-4-5 …）都映射到它 —— 不再落到
+// 「网关目录第一条」，那条顺序会变，曾把请求带到 hy3。
+// `--model-allowlist <id,id>` 或 `ANB_MODEL_ALLOWLIST` 仍然优先（逗号分隔的真实
+// 网关 id）；显式置空即恢复出厂行为（整份目录 + 目录头兜底）。
+const PINNED_MODEL = 'cn:deepseek-v4.1-flash';
+const MODEL_ALLOWLIST = String(
+  args['model-allowlist'] ?? process.env.ANB_MODEL_ALLOWLIST ?? PINNED_MODEL,
+).split(',').map((s) => s.trim()).filter(Boolean);
+// 2026-11-03：只改 Claude 选择器里的显示名/说明，后端模型仍是 PINNED_MODEL（1M）。
+// 置空（''）即回落到网关真名。
+const PINNED_LABEL = 'Opus 5.5';
+const PINNED_DESCRIPTION = '1M 上下文 · 实际调用 DeepSeek-V4.1-Flash（1M）';
+// 2026-11-03（第二轮）：Claude 侧要求「名字后面不带 1M」但仍是 1M 上下文。
+// 实测 claude 2.1.309：未知 id 即便设了 CLAUDE_CODE_MAX_CONTEXT_TOKENS 也只报
+// contextWindow=200000；而 CLI 原生认识的 `claude-opus-5-5` 天生 contextWindow=1000000。
+// 故把对外投影 id 换成它，并停发 [1m] tag / supports_1m / prefer_1m（否则 Desktop 会
+// 给会话 id 追加 `[1m]`，UI 名字后面就多一个 “1M”）。后端仍是 PINNED_MODEL。
+const EXPOSE_MODEL_ID = 'claude-opus-5-5';
 /**
  * Synthetic id for a gateway model.
  *
@@ -368,8 +390,10 @@ function resolveModel(rawId) {
   // Claude-style alias (claude-sonnet-5, sonnet, opus…) — Desktop or the CLI
   // may ask for one when the picker was never touched.
   const alias = /^(?:claude-)?(sonnet|opus|haiku|fable|mythos)(?:[-\d.]+)?$/i.test(stripped);
-  const fallback = CATALOG.byReal.get(String(args['default-model'] || process.env.ANB_DEFAULT_MODEL || ''))
-    || CATALOG.list[0];
+  const fallback = CATALOG.byReal.get(String(
+    args['default-model'] || process.env.ANB_DEFAULT_MODEL || MODEL_ALLOWLIST[0] || '',
+  )) || CATALOG.list[0];
+  if (EXPOSE_MODEL_ID && stripped.toLowerCase() === EXPOSE_MODEL_ID) return fallback;
   if (alias && fallback) {
     log(`model alias "${raw}" -> ${fallback.real}`);
     return fallback;
@@ -975,11 +999,20 @@ const server = createServer(async (req, res) => {
   if (req.method === 'GET' && (url === '/v1/models' || url === '/models')) {
     try {
       const c = await catalog();
-      const data = c.list.map((m) => ({
+      // 本机 pin（2026-11-03）：Claude 目录只投影 allowlist 内的模型。
+      const visible = MODEL_ALLOWLIST.length
+        ? c.list.filter((m) => MODEL_ALLOWLIST.includes(m.real))
+        : c.list;
+      if (MODEL_ALLOWLIST.length && visible.length === 0) {
+        log(`model allowlist ${JSON.stringify(MODEL_ALLOWLIST)} matched nothing; exposing the whole catalog`);
+      }
+      const listed = visible.length ? visible : c.list;
+      const data = listed.map((m) => ({
         type: 'model',
-        id: m.anon,
-        display_name: m.label,
-        description: m.description,
+        id: m.real === PINNED_MODEL && EXPOSE_MODEL_ID ? EXPOSE_MODEL_ID : m.anon,
+        // 本机 pin：显示名换成 Claude 风格的 PINNED_LABEL，id/后端不变。
+        display_name: m.real === PINNED_MODEL && PINNED_LABEL ? PINNED_LABEL : m.label,
+        description: m.real === PINNED_MODEL && PINNED_LABEL ? PINNED_DESCRIPTION : m.description,
         created_at: '2025-01-01T00:00:00Z',
         // Desktop reads these off the discovery row and nothing else:
         //   max_input_tokens   -> the context window it shows (default 200 000
@@ -991,7 +1024,9 @@ const server = createServer(async (req, res) => {
         ...(m.maxOutput && { max_output_tokens: m.maxOutput }),
         ...(m.maxEffort && { max_effort_level: m.maxEffort }),
         ...(m.behavesAs && { behaves_as: m.behavesAs }),
-        ...(m.contextWindow >= 1_000_000 && { prefer_1m: true }),
+        // 本机 pin（2026-11-03 第二轮）：不再发 supports_1m / prefer_1m。发 prefer_1m
+        // 会让 Desktop 把会话 model id 改成 `${id}[1m]`，UI 名字后面就追加 “1M”。
+        // 现在靠 EXPOSE_MODEL_ID 自带的 1M 属性，无后缀、无 tag。
       }));
       res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({
         data,
