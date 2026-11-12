@@ -340,6 +340,31 @@ anthropicBridge: up (http://127.0.0.1:7865/healthz, pid 14593)
 
 这个默认值放在桥**自己的代码里**，而不是某个启动器的环境变量里：桥会被 DSH supervisor 拉起、被 `start-bridge.vbs` 拉起、调试时还会手工 `node bridge.mjs`，只有把默认值写进代码，换一条启动路径才不会静默失去保护。
 
+## 不装 DSH 也能用：`wb2-cross`
+
+本仓库的主线是 DSH 插件，装它得先有 DSH。[`wb2-cross/`](wb2-cross/README.md) 是同一套请求翻译的**独立版**：零依赖、单文件桥、一条命令装、一条命令回滚，不需要 DSH、不需要本插件，也不打任何二进制补丁。
+
+它面对的是本插件在客户端侧遇到的同一组问题，只是换了落点：
+
+| | 本插件 | `wb2-cross` |
+|---|---|---|
+| 运行方式 | DSH supervisor 托管 | 独立 `node` 进程（默认 `:7888`） |
+| 客户端接入 | 写 provider、写 OAuth 环境 | 写 `~/.codex/config.toml`、`~/.claude/settings.json` |
+| system 层 | 桥内置 | `src/payload.md`，`replace` / `append` / `prepend` 三选一 |
+| 备份与回滚 | 卸插件 | `wb2-cross revert`，逐键还原原始值 |
+
+```powershell
+cd wb2-cross
+node src/cli.mjs install     # 改配置 + 备份 + 拉起 :7888
+node src/cli.mjs doctor      # 身份探针 + 越界探针自检
+node src/cli.mjs revert      # 精确回滚
+```
+
+两条硬约束两边都成立，值得单独记住：
+
+- 网关 `prompt.mode` 不能是 `passthrough`——它会丢弃客户端的 system 消息（实测 system 从 0 到 8000 字符，`prompt_tokens` 恒为 77）。`install` 会改成 `append` 并备份。
+- 同一份指令只能出现在**一个**通道。system 层与 `AGENTS.md` 同时存在时，模型会判定为注入并把两处一起丢掉。
+
 ## 范围与限制
 
 - 只做进程监管加请求翻译。它不启动、停止或配置*上游* provider，也不对你账号能用哪些模型发表意见。

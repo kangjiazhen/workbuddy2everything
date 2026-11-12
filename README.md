@@ -340,6 +340,31 @@ Two consequences the bridge handles directly:
 
 Set it a little **above** the real ceiling (`1200000` for a `1048576`-token upstream) so an estimate that runs high cannot refuse a request that would have fit. The estimate is deliberately crude — ~4 chars/token for text, ~1 char/token for long base64 runs, a fixed vision cost per image — which is why it is a tripwire and not a context manager.
 
+## Without DSH: `wb2-cross`
+
+This repository is a DSH plugin, so using it presupposes DSH. [`wb2-cross/`](wb2-cross/README.md) is the **standalone** build of the same request translation: zero dependencies, one bridge file, one command to install, one command to roll back — no DSH, no plugin, and no binary patching.
+
+It solves the same client-side problems as the plugin, just anchored elsewhere:
+
+| | This plugin | `wb2-cross` |
+|---|---|---|
+| Runs as | supervised by DSH | a plain `node` process (default `:7888`) |
+| Client wiring | provider registration, OAuth env | `~/.codex/config.toml`, `~/.claude/settings.json` |
+| System layer | built into the bridge | `src/payload.md`, `replace` / `append` / `prepend` |
+| Backup / undo | uninstall the plugin | `wb2-cross revert`, restores exact prior values |
+
+```powershell
+cd wb2-cross
+node src/cli.mjs install     # rewrite configs, back them up, start :7888
+node src/cli.mjs doctor      # identity probe + out-of-scope probe
+node src/cli.mjs revert      # exact rollback
+```
+
+Two hard constraints hold on both sides:
+
+- Gateway `prompt.mode` must not be `passthrough` — it drops the client's system messages (measured: system text from 0 to 8000 characters left `prompt_tokens` at 77). `install` switches it to `append` and backs it up.
+- The same instruction may appear in exactly **one** channel. With both a system layer and `AGENTS.md` present, the model reads it as an injection attempt and discards both.
+
 ## Scope and limits
 
 - Process supervision plus a request translator. It does not start, stop, or configure the *upstream* provider, and it has no opinion about which models your account may use.

@@ -1,0 +1,34 @@
+{
+  "name": "wb2-cross",
+  "version": "1.0.0",
+  "description": "Local conversion layer that puts Codex (Responses API) and Claude Code (Anthropic Messages) on top of a wb2api gateway, injecting a system-layer payload.",
+  "type": "module",
+  "bin": {
+    "wb2-cross": "src/cli.mjs"
+  },
+  "files": [
+    "src/bridge.mjs",
+    "src/cli.mjs",
+    "src/payload.md",
+    "build-payload.mjs",
+    "start.mjs",
+    "start.cmd",
+    "start-all.ps1",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "status": "node src/cli.mjs status",
+    "install-addon": "node src/cli.mjs install",
+    "revert": "node src/cli.mjs revert",
+    "serve": "node src/cli.mjs serve",
+    "doctor": "node src/cli.mjs doctor",
+    "build:payload": "node build-payload.mjs"
+  },
+  "keywords": ["codex", "claude-code", "anthropic", "openai-responses", "bridge", "gateway"],
+  "license": "MIT"
+}
+
