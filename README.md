@@ -362,7 +362,7 @@ node src/cli.mjs revert      # exact rollback
 
 Two hard constraints hold on both sides:
 
-- Gateway `prompt.mode` must not be `passthrough` — it drops the client's system messages (measured: system text from 0 to 8000 characters left `prompt_tokens` at 77). `install` switches it to `append` and backs it up.
+- Gateway `prompt.mode` must be `passthrough` — the only mode that actually hands the client system block to the model. Measured back to back: under `passthrough`, system 0→1KB moved `prompt_tokens` from 31 to 282; under `append` it went 522→56, and `custom` replaces it outright. `install` switches it to `passthrough` and backs it up; restart the gateway afterwards.
 - The same instruction may appear in exactly **one** channel. With both a system layer and `AGENTS.md` present, the model reads it as an injection attempt and discards both.
 
 ## Scope and limits

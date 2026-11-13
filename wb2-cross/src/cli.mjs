@@ -144,18 +144,28 @@ function removeTopLevel(text, key) {
 
 /* ---------------- 网关 prompt.mode ---------------- */
 
-function ensureGatewayAppend() {
+// passthrough is the only mode that reliably delivers the client system block
+// to the model. Measured on the same gateway, same model, back to back:
+//   passthrough    no system 31 tok | 1KB system 282 tok  -> delivered
+//   append         no system 522    | 1KB/8KB system 56   -> discarded
+//   custom         no system 681    | client system gone -> replaced
+// (append/custom are documented to keep or replace the client system; in
+// practice both end up discarding it, which silently defeats the payload and
+// looks exactly like "the payload stopped working" a day later.)
+const GATEWAY_PROMPT_MODE = 'passthrough';
+
+function ensureGatewayPassthrough() {
   const cfgPath = findGatewayConfig();
   if (!cfgPath) { warn('没找到 workbuddy2api-panel/config.json，跳过 prompt.mode 调整'); return false; }
   const cfg = readJson(cfgPath);
   if (!cfg) { warn(`网关配置不可解析: ${cfgPath}`); return false; }
   const cur = cfg.prompt?.mode ?? '(未设)';
-  if (cur === 'append') { ok(`网关 prompt.mode 已是 append  ${cfgPath}`); return true; }
-  act(`网关 prompt.mode: ${cur} -> append  (${cfgPath})`);
+  if (cur === GATEWAY_PROMPT_MODE) { ok(`网关 prompt.mode 已是 ${GATEWAY_PROMPT_MODE}  ${cfgPath}`); return true; }
+  act(`网关 prompt.mode: ${cur} -> ${GATEWAY_PROMPT_MODE}  (${cfgPath})`);
   if (!DRY) {
     const bk = backup(cfgPath, 'prompt-mode');
     cfg.prompt = cfg.prompt || {};
-    cfg.prompt.mode = 'append';
+    cfg.prompt.mode = GATEWAY_PROMPT_MODE;
     writeJson(cfgPath, cfg);
     if (bk) info(`备份 ${bk}`);
   }
@@ -397,7 +407,7 @@ async function cmdInstall() {
   state.installedAt = new Date().toISOString();
   state.port = PORT; state.gateway = GATEWAY; state.model = MODEL; state.mode = MODE;
 
-  ensureGatewayAppend();
+  ensureGatewayPassthrough();
   if (!has('no-codex')) codexInstall(state);
   if (!has('no-claude')) claudeInstall(state);
   writeState(state);

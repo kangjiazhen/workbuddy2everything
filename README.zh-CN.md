@@ -362,7 +362,7 @@ node src/cli.mjs revert      # 精确回滚
 
 两条硬约束两边都成立，值得单独记住：
 
-- 网关 `prompt.mode` 不能是 `passthrough`——它会丢弃客户端的 system 消息（实测 system 从 0 到 8000 字符，`prompt_tokens` 恒为 77）。`install` 会改成 `append` 并备份。
+- 网关 `prompt.mode` 必须是 `passthrough`——这是唯一真的把客户端 system 交出去的模式。背靠背实测：`passthrough` 下 system 0→1KB 让 `prompt_tokens` 从 31 涨到 282；`append` 下却是 522→56，`custom` 直接替换。`install` 会改成 `passthrough` 并备份，改完重启网关。
 - 同一份指令只能出现在**一个**通道。system 层与 `AGENTS.md` 同时存在时，模型会判定为注入并把两处一起丢掉。
 
 ## 范围与限制

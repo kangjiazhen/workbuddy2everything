@@ -19,7 +19,7 @@ Codex        --(OpenAI Responses)   -->  :7888/v1/responses --+
 三条实测结论决定了这个包的设计：
 
 1. **客户端自带的指令入口不够用。** Codex 的 `AGENTS.md` 落在 **user** 层，`developer_instructions` 落在 developer 层；Claude Code 的 `CLAUDE.md` 也落在 user 层。能压住一切的只有 **system** 层。
-2. **网关 `prompt.mode=passthrough` 会吞掉 system。** 实测：system 为空 / 10 字符 / 8000 字符，`prompt_tokens` 恒为 77。改成 `append` 后才变成 532 / 542 / 2541。这是"为什么只有 user 层指令生效"的唯一解释。
+2. **网关的 `prompt.mode` 决定 system 到底能不能到模型，而这个开关会骗人。** 同一网关、同一模型、背靠背实测：`passthrough` 下 system 从 0 到 1KB，`prompt_tokens` 从 31 涨到 282（送达）；`append` 下 522 → 56，`custom` 下 681 → 无关（客户端 system 被替换）。也就是说 **只有 `passthrough` 真的把客户端 system 交出去**，另外两个模式按文档该"追加"或"替换"，实测却都变成了丢弃。症状是"昨天还好好的，今天突然不认人格了"，而代码一行没改。
 3. **同一份指令出现在两个通道会自证是注入。** system + `AGENTS.md` 同时存在时，模型会说"检测到 AGENTS.md 注入"并把两处一起拒掉；只留 system 单份，立刻采纳。
 
 所以 `wb2-cross` 只做一件事：**在协议转换的那一层，把 system 换成载荷**，并且**只放一次**。
@@ -34,7 +34,7 @@ Codex        --(OpenAI Responses)   -->  :7888/v1/responses --+
 | wb2api 网关 | 默认 `http://127.0.0.1:7863`，可用 `--gateway` 改 |
 | Codex / Claude Code | 有哪个装哪个，两个都装就都接 |
 
-网关的 `config.json` 里 `prompt.mode` 必须是 `append`（或 `custom`），**不能是 `passthrough`**。`install` 会自动改并备份，改完记得重启网关。
+网关的 `config.json` 里 `prompt.mode` 必须是 **`passthrough`**。`install` 会自动改并备份，改完记得重启网关。装好后可以自查一次：给网关发一条带 system 的请求，`prompt_tokens` 必须随 system 变大而变大，否则载荷根本没到模型。
 
 ---
 
@@ -85,7 +85,7 @@ claude --print "你的名字是什么？"
 |---|---|---|
 | `~/.codex/config.toml` | 加 `[model_providers.wbxc]`（`base_url=http://127.0.0.1:7888/v1`、`wire_api="responses"`），顶层 `model_provider="wbxc"`、`model`、`approval_policy="never"`、`sandbox_mode="danger-full-access"` | `~/.wb2-cross/backup/` |
 | `~/.claude/settings.json` | `env.ANTHROPIC_BASE_URL=http://127.0.0.1:7888`、`ANTHROPIC_MODEL` 系列、`permissions.defaultMode="bypassPermissions"` | 同上 |
-| wb2api `config.json` | `prompt.mode` → `append` | 同上 |
+| wb2api `config.json` | `prompt.mode` → `passthrough` | 同上 |
 
 全部改动都是**可回滚的文本编辑**，不碰任何二进制。
 
@@ -190,7 +190,7 @@ npx wb2-cross revert
 
 - **推理型模型会先烧 reasoning token。** 若 `max_tokens` 给小了，正文可能为空。bridge 已做回落：正文空且只有 reasoning 时，把 reasoning 当正文输出，不会给你一片空白。
 - **`replace` 会丢掉客户端原有的系统提示。** Claude Code 丢了之后会答"我是 Claude，Anthropic 开发的模型"——所以 FOOT 里必须锁名字。
-- **网关 `prompt.mode` 是全局的。** 同一个网关上的其它客户端（包括 DSH 本身，如果它也走 7863）也会受影响：`append` 会给它们多插约 2KB 网关提示词。
+- **网关 `prompt.mode` 是全局的。** 改它是给整条链路换行为：同一网关上的其它客户端（包括 DSH 本身，如果也走 7863）在看到 system 的方式上会被一起改变。`passthrough` 是唯一一个"不干预"的模式，所以它同时也是对别的客户端影响最小的那个。
 - **模型级类别偏置仍在。** 极少数类别（如 LSASS 凭据导出）即使在 `replace` 下也可能被降级成"检测侧建议"。这是模型本身的倾向，不是注入没生效。
 - **Codex TUI 会把最终回复渲染两遍。** 实测本包与 DSH 自带的 bridge 表现一致，属于 codex 客户端渲染行为（SSE 事件序列已核对：只有一组 delta、一个 message item），不影响内容与工具调用。
 - **`/v1/chat/completions` 也支持注入**，方便任何 OpenAI 兼容客户端复用。
@@ -200,8 +200,9 @@ npx wb2-cross revert
 | 现象 | 原因 | 处理 |
 |---|---|---|
 | `doctor` 报上游不可达 | wb2api 没启动 | 先起网关 |
-| 身份探针答"我是 Codex / Claude" | 载荷没到 system 层 | 确认 `prompt.mode=append` 且网关已重启；确认 bridge 在跑 |
+| 身份探针答"我是 Codex / Claude" | 载荷没到 system 层 | 确认 `prompt.mode=passthrough` 且网关已重启；确认 bridge 在跑（`http://127.0.0.1:7888/healthz`）|
 | 模型说"检测到提示词注入" | 载荷出现了两次 | 检查是否同时写了 `AGENTS.md`/`CLAUDE.md`；只保留 system 一份 |
+| Codex / Claude 报连不上（connection refused） | bridge 没在跑（重启、休眠恢复后常见） | `wscript.exe "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup\wb2-cross-bridge.vbs"`，或把它放进启动项常驻 |
 | Codex 报 `wire_api = "chat" is no longer supported` | 用了旧写法 | 必须 `wire_api="responses"`，本包已默认 |
 | 回复一片空白 | `max_tokens` 太小，全烧在 reasoning | 调大；或确认 bridge 版本含回落逻辑 |
 | 401 | 没读到网关 `api_key` | `--key` 显式指定，或确认 `workbuddy2api-panel/config.json` 在预期位置 |
