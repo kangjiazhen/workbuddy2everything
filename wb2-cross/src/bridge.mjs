@@ -19,6 +19,7 @@
  */
 import http from 'node:http';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -86,11 +87,25 @@ const log = (...a) => {
 };
 
 function readGatewayKey() {
+  // cwd has to be treated as hostile: the bridge is normally started by a
+  // supervisor or a Task Scheduler entry, whose cwd is the system32 directory,
+  // not the install location. Relying on cwd-relative guesses means the key
+  // silently disappears exactly when nobody is watching - the symptom is a 401
+  // from the gateway that surfaces in Codex as "stream disconnected".
+  const recorded = (() => {
+    try {
+      const st = JSON.parse(fs.readFileSync(path.join(os.homedir(), '.wb2-cross', 'state.json'), 'utf8'));
+      return st && typeof st.gatewayConfig === 'string' ? st.gatewayConfig : null;
+    } catch { return null; }
+  })();
   const candidates = [
     args['gateway-config'],
     process.env.WBXC_GATEWAY_CONFIG,
-    path.join(HERE, '..', 'workbuddy2api-panel', 'config.json'),
+    recorded,
+    path.join(HERE, '..', '..', '..', 'workbuddy2api-panel', 'config.json'),
     path.join(HERE, '..', '..', 'workbuddy2api-panel', 'config.json'),
+    path.join(HERE, '..', 'workbuddy2api-panel', 'config.json'),
+    path.join(os.homedir(), 'Documents', 'deepseek-harness', 'default-workspace', 'workbuddy2api-panel', 'config.json'),
     path.join(process.cwd(), 'workbuddy2api-panel', 'config.json'),
     path.join(process.cwd(), 'config.json'),
   ].filter(Boolean);
@@ -384,7 +399,24 @@ async function handleAnthropic(req, res, body) {
     blockKind = null;
   };
 
-  const up = await callUpstream(chat);
+  let up;
+  try {
+    up = await callUpstream(chat);
+  } catch (err) {
+    // Same reasoning as handleResponses: message_start already went out, so a
+    // JSON status code is impossible. Anthropic clients understand an `error`
+    // event mid-stream; without it Claude Code reports a bare connection loss.
+    log(`[err] ${err.message}`);
+    em.send('error', {
+      type: 'error',
+      error: {
+        type: err.status === 401 ? 'authentication_error' : 'api_error',
+        message: String(err.message).slice(0, 600),
+      },
+    });
+    em.end();
+    return;
+  }
   for await (const ev of upstreamEvents(up)) {
     if (ev.type === 'text') {
       sawText = true;
@@ -558,7 +590,29 @@ async function handleResponses(req, res, body) {
     toolOpenIdx = -1;
   };
 
-  const up = await callUpstream(chat);
+  let up;
+  try {
+    up = await callUpstream(chat);
+  } catch (err) {
+    // SSE headers are already out, so the outer handler cannot answer with a
+    // JSON status any more: the client would only ever see "stream closed
+    // before response.completed" and report a generic network fault. Emit the
+    // documented failure event instead so 401 / gateway-down reach the user.
+    log(`[err] ${err.message}`);
+    em.send('response.failed', {
+      type: 'response.failed',
+      response: {
+        ...baseResponse,
+        status: 'failed',
+        error: {
+          code: err.status === 401 ? 'invalid_api_key' : 'upstream_error',
+          message: String(err.message).slice(0, 600),
+        },
+      },
+    });
+    em.end();
+    return;
+  }
   for await (const ev of upstreamEvents(up)) {
     if (ev.type === 'text') {
       if (toolOpenIdx >= 0) closeToolItem();

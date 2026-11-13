@@ -202,10 +202,26 @@ npx wb2-cross revert
 | `doctor` 报上游不可达 | wb2api 没启动 | 先起网关 |
 | 身份探针答"我是 Codex / Claude" | 载荷没到 system 层 | 确认 `prompt.mode=passthrough` 且网关已重启；确认 bridge 在跑（`http://127.0.0.1:7888/healthz`）|
 | 模型说"检测到提示词注入" | 载荷出现了两次 | 检查是否同时写了 `AGENTS.md`/`CLAUDE.md`；只保留 system 一份 |
-| Codex / Claude 报连不上（connection refused） | bridge 没在跑（重启、休眠恢复后常见） | `wscript.exe "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup\wb2-cross-bridge.vbs"`，或把它放进启动项常驻 |
+| Codex / Claude 报连不上（connection refused） | bridge 没在跑（重启、休眠恢复后常见） | 跑一次 `powershell -File ~/.wb2-cross/ensure.ps1`；正常情况下登录后会自己起来 |
+| Codex 报 `stream disconnected before completion: stream closed before response.completed` | 上游在流开始后报错（401、网关挂了）。旧版本把 JSON 错误塞进 SSE，客户端只能看到"流断了" | 升级到本版本：现在会发 `response.failed` / `error` 事件带真实原因；同时看 `~/.wb2-cross/bridge.log` 的 `[err]` 行 |
 | Codex 报 `wire_api = "chat" is no longer supported` | 用了旧写法 | 必须 `wire_api="responses"`，本包已默认 |
 | 回复一片空白 | `max_tokens` 太小，全烧在 reasoning | 调大；或确认 bridge 版本含回落逻辑 |
-| 401 | 没读到网关 `api_key` | `--key` 显式指定，或确认 `workbuddy2api-panel/config.json` 在预期位置 |
+| 401，且日志写 `没找到网关 bearer` | 进程由启动项/计划任务拉起，cwd 是 `system32`，cwd 相对路径猜不到 `config.json` | 本版本已修：先读 `~/.wb2-cross/state.json` 里记录的绝对路径，再由 `install` 生成带 `--gateway-config` 的 supervisor |
+
+## 常驻与自愈
+
+`install` 会写三样东西（Windows）：
+
+| 文件 | 作用 |
+|---|---|
+| `~/.wb2-cross/bridge-supervisor.cmd` | 循环拉起 bridge：进程死掉 5 秒后重来；已在跑时直接退出，不会开第二份 |
+| `~/.wb2-cross/bridge-supervisor.vbs` | 隐藏窗口启动上面那个 cmd |
+| `%APPDATA%\...\Startup\wb2-cross-bridge.vbs` | 登录时拉起 supervisor（放启动项，不需要管理员） |
+
+计划任务 `wb2-cross-ensure` 每 5 分钟跑一次 `~/.wb2-cross/ensure.ps1`：7863 不在就调 `workbuddy2api-panel/start.ps1`，7888 不在就拉 supervisor。`revert` 会删掉这三样和计划任务留下的文件。
+
+> supervisor 里以明文写着 `--key`（取自网关 `config.json`）。它只存在本机用户目录，不要把这个文件提交到仓库或分享出去；换网关 key 后重跑一次 `install` 即可刷新。
+
 
 ---
 
