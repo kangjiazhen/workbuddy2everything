@@ -342,6 +342,8 @@ anthropicBridge: up (http://127.0.0.1:7865/healthz, pid 14593)
 
 ## 不装 DSH 也能用：`wb2-cross`
 
+> 已独立成库：**https://github.com/kangjiazhen/wb2-cross** —— clone 下来跑 `node src/cli.mjs install --upstream ... --api-key ...` 即可，这里的 `wb2-cross/` 仅作参考。
+
 本仓库的主线是 DSH 插件，装它得先有 DSH。[`wb2-cross/`](wb2-cross/README.md) 是同一套请求翻译的**独立版**：零依赖、单文件桥、一条命令装、一条命令回滚，不需要 DSH、不需要本插件，也不打任何二进制补丁。
 
 它面对的是本插件在客户端侧遇到的同一组问题，只是换了落点：
