@@ -144,17 +144,18 @@ function removeTopLevel(text, key) {
 
 /* ---------------- 网关 prompt.mode ---------------- */
 
-// passthrough is the only mode that reliably delivers the client system block
-// to the model. Measured on the same gateway, same model, back to back:
-//   passthrough    no system 31 tok | 1KB system 282 tok  -> delivered
-//   append         no system 522    | 1KB/8KB system 56   -> discarded
-//   custom         no system 681    | client system gone -> replaced
-// (append/custom are documented to keep or replace the client system; in
-// practice both end up discarding it, which silently defeats the payload and
-// looks exactly like "the payload stopped working" a day later.)
-const GATEWAY_PROMPT_MODE = 'passthrough';
+// Only "append" delivers the client system block to the model. Measured on the
+// same gateway (wb2api 1.13.0-panel), same model cn:deepseek-v4.1-flash, with a
+// one-line "your name is Zeta" system prompt:
+//   passthrough  no system 63 tok | 8KB system 63 tok   -> system discarded
+//   append       no system 63 tok | 1KB system 548 tok  -> system delivered ("我是 Zeta")
+// Both modes must be restarted to take effect: /panel/api/config reports
+// restart_required and keeps serving the old mode until the process is recycled.
+// (A discarded system block looks exactly like "the payload stopped working",
+// because the bridge's injection has nowhere to land.)
+const GATEWAY_PROMPT_MODE = 'append';
 
-function ensureGatewayPassthrough(state) {
+function ensureGatewayAppend(state) {
   const cfgPath = findGatewayConfig();
   if (!cfgPath) { warn('没找到 workbuddy2api-panel/config.json，跳过 prompt.mode 调整'); return false; }
   if (state) state.gatewayConfig = cfgPath;
@@ -493,7 +494,7 @@ async function cmdInstall() {
   state.installedAt = new Date().toISOString();
   state.port = PORT; state.gateway = GATEWAY; state.model = MODEL; state.mode = MODE;
 
-  ensureGatewayPassthrough(state);
+  ensureGatewayAppend(state);
   if (!has('no-codex')) codexInstall(state);
   if (!has('no-claude')) claudeInstall(state);
   writeState(state);
@@ -527,6 +528,14 @@ async function cmdServe() {
   process.env.WBXC_UPSTREAM = `${GATEWAY}/v1`;
   process.env.WBXC_MODEL = MODEL;
   process.env.WBXC_MODE = MODE;
+  // 其余开关原样透传给 bridge：--target / --min-tokens / --force-model / --no-model-pass
+  const TARGET = val('target', process.env.WBXC_TARGET || 'system');
+  const MINTOK = val('min-tokens', process.env.WBXC_MIN_TOKENS || '16000');
+  const FORCE = val('force-model', process.env.WBXC_FORCE_MODEL || '');
+  process.env.WBXC_TARGET = TARGET;
+  process.env.WBXC_MIN_TOKENS = MINTOK;
+  if (FORCE) process.env.WBXC_FORCE_MODEL = FORCE;
+  if (has('no-model-pass')) process.env.WBXC_MODEL_PASSTHROUGH = '0';
   await import(BRIDGE);
 }
 
@@ -536,14 +545,33 @@ async function cmdDoctor() {
   const check = (cond, good, badMsg) => { if (cond) ok(good); else { bad(badMsg); fails++; } };
 
   check(fs.existsSync(PAYLOAD), `载荷就绪 ${fs.readFileSync(PAYLOAD, 'utf8').length} 字符`, '载荷缺失');
-  const upOpen = await portOpen(new URL(GATEWAY).port || 80);
-  check(upOpen, `上游网关 ${GATEWAY} 可达`, `上游网关 ${GATEWAY} 不可达（先启动 wb2api）`);
-  check(await portOpen(PORT), `bridge :${PORT} 在跑`, `bridge :${PORT} 未运行（wb2-cross install 或 serve）`);
 
-  if (await portOpen(PORT)) {
+  // 桥在跑就以它自报的事实为准：上游地址、实际读到的网关配置、注入层。
+  // 否则 doctor 只会照着 --gateway 默认值猜，猜错就把一个健康的安装报成坏的。
+  const bridgeUp = await portOpen(PORT);
+  let h = null;
+  if (bridgeUp) {
+    try { h = await (await fetch(`http://127.0.0.1:${PORT}/healthz`)).json(); } catch { h = null; }
+  }
+  const upstream = h?.upstream ? String(h.upstream).replace(/\/v1$/, '') : GATEWAY;
+  const upOpen = await portOpen(new URL(upstream).port || 80);
+  check(upOpen, `上游网关 ${upstream} 可达`, `上游网关 ${upstream} 不可达（先启动 wb2api）`);
+
+  // prompt.mode 必须是 append：passthrough 会把客户端 system 整个吞掉，载荷无处落地。
+  const gwCfgPath = h?.gatewayConfig || readState()?.gatewayConfig || findGatewayConfig();
+  if (gwCfgPath && fs.existsSync(gwCfgPath)) {
+    const gw = readJson(gwCfgPath);
+    const pm = gw?.prompt?.mode ?? '(未设)';
+    check(pm === 'append',
+      `网关 prompt.mode=${pm}（system 可达模型）  ${gwCfgPath}`,
+      `网关 prompt.mode=${pm}，system 会被丢弃 -> 改成 append 并重启网关（${gwCfgPath}）`);
+  }
+  if (h) ok(`注入层 target=${h.target}  max_tokens 下限=${h.minTokens}`);
+  check(bridgeUp, `bridge :${PORT} 在跑`, `bridge :${PORT} 未运行（wb2-cross install 或 serve）`);
+
+  if (bridgeUp) {
     try {
-      const h = await (await fetch(`http://127.0.0.1:${PORT}/healthz`)).json();
-      ok(`healthz ok  mode=${h.mode} payload=${h.payload}`);
+      ok(`healthz ok  mode=${h?.mode} payload=${h?.payload}`);
       const models = await (await fetch(`http://127.0.0.1:${PORT}/v1/models`)).json();
       ok(`/v1/models 返回 ${models.data?.length ?? 0} 条`);
     } catch (e) { bad(`healthz 失败: ${e.message}`); fails++; }

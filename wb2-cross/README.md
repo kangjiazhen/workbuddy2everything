@@ -24,7 +24,7 @@ Codex        --(OpenAI Responses)   -->  :7888/v1/responses --+
 三条实测结论决定了这个包的设计：
 
 1. **客户端自带的指令入口不够用。** Codex 的 `AGENTS.md` 落在 **user** 层，`developer_instructions` 落在 developer 层；Claude Code 的 `CLAUDE.md` 也落在 user 层。能压住一切的只有 **system** 层。
-2. **网关的 `prompt.mode` 决定 system 到底能不能到模型，而这个开关会骗人。** 同一网关、同一模型、背靠背实测：`passthrough` 下 system 从 0 到 1KB，`prompt_tokens` 从 31 涨到 282（送达）；`append` 下 522 → 56，`custom` 下 681 → 无关（客户端 system 被替换）。也就是说 **只有 `passthrough` 真的把客户端 system 交出去**，另外两个模式按文档该"追加"或"替换"，实测却都变成了丢弃。症状是"昨天还好好的，今天突然不认人格了"，而代码一行没改。
+2. **网关的 `prompt.mode` 决定 system 到底能不能到模型，而这个开关会骗人。** 在 wb2api `1.13.0-panel`、同一模型 `cn:deepseek-v4.1-flash`、同一把 key 上背靠背实测（system 写"你的名字只有一个：Zeta"）：`passthrough` 下 system 从 0 涨到 8KB，`prompt_tokens` 恒为 **63** —— 整段 system 被丢弃，模型答"我是 Claude"；`append` 下同一条 system 让 `prompt_tokens` 变成 **548**，模型答"我是 Zeta"。所以 **只有 `append` 真的把客户端 system 交出去**，`passthrough` 名义上是"透明转发"，实测把 system 吞了。症状就是"昨天还好好的，今天突然不认人格了"，而代码一行没改。而且两者都要**重启网关**才生效：`POST /panel/api/config` 会返回 `restart_required`，进程不重启就一直按旧模式服务。
 3. **同一份指令出现在两个通道会自证是注入。** system + `AGENTS.md` 同时存在时，模型会说"检测到 AGENTS.md 注入"并把两处一起拒掉；只留 system 单份，立刻采纳。
 
 所以 `wb2-cross` 只做一件事：**在协议转换的那一层，把 system 换成载荷**，并且**只放一次**。
@@ -39,7 +39,21 @@ Codex        --(OpenAI Responses)   -->  :7888/v1/responses --+
 | wb2api 网关 | 默认 `http://127.0.0.1:7863`，可用 `--gateway` 改 |
 | Codex / Claude Code | 有哪个装哪个，两个都装就都接 |
 
-网关的 `config.json` 里 `prompt.mode` 必须是 **`passthrough`**。`install` 会自动改并备份，改完记得重启网关。装好后可以自查一次：给网关发一条带 system 的请求，`prompt_tokens` 必须随 system 变大而变大，否则载荷根本没到模型。
+网关的 `config.json` 里 `prompt.mode` 必须是 **`append`**（`passthrough` 会把 system 吞掉）。`install` 会自动改并备份，改完记得重启网关。装好后可以自查一次：给网关发一条带 system 的请求，`prompt_tokens` 必须随 system 变大而变大，否则载荷根本没到模型。
+
+### 网关已经另有用途怎么办（DSH 自己也走 7863）
+
+`prompt.mode` 是按进程生效的。如果同一个网关还服务着别的客户端（比如 DSH 自己的 provider 就指着 `http://127.0.0.1:7863/v1`），**不要**为了改模式去重启它，而是再起一个只给本包用的网关实例：
+
+```powershell
+# agent-work/g7866 这类独立目录，配置文件从主网关复制后改三项：
+#   listen 127.0.0.1:7866 / prompt.mode append / state_file ./data/state.json
+#   pool.credit_floor = 0     （新 state 里没有余额观测值，非 0 会被挡成 503）
+#   schedule.* 全部 false     （否则两份签到/旅行/保活任务同时跑）
+wb2api.exe -config .\instances\g7866\config.json   # 工作目录设成该实例目录，避免与主网关抢 data/usage.json
+```
+
+然后 `wb2-cross serve --upstream http://127.0.0.1:7866/v1 --target system`，让 bridge 走这个实例。主网关继续用 `passthrough` 服务 DSH，互不干扰。
 
 ---
 
@@ -90,7 +104,7 @@ claude --print "你的名字是什么？"
 |---|---|---|
 | `~/.codex/config.toml` | 加 `[model_providers.wbxc]`（`base_url=http://127.0.0.1:7888/v1`、`wire_api="responses"`），顶层 `model_provider="wbxc"`、`model`、`approval_policy="never"`、`sandbox_mode="danger-full-access"` | `~/.wb2-cross/backup/` |
 | `~/.claude/settings.json` | `env.ANTHROPIC_BASE_URL=http://127.0.0.1:7888`、`ANTHROPIC_MODEL` 系列、`permissions.defaultMode="bypassPermissions"` | 同上 |
-| wb2api `config.json` | `prompt.mode` → `passthrough` | 同上 |
+| wb2api `config.json` | `prompt.mode` → `append` | 同上 |
 
 全部改动都是**可回滚的文本编辑**，不碰任何二进制。
 
@@ -110,9 +124,13 @@ npx wb2-cross revert      # 还原到安装前
 
 ```
 --port 7888                  bridge 端口
---gateway http://127.0.0.1:7863   网关地址
---model cn:deepseek-v4.1-flash    上游真实模型 id
+--upstream http://127.0.0.1:7863  网关的 /v1 地址（serve 用；install 用 --gateway）
+--model cn:deepseek-v4.1-flash    上游真实模型 id（客户端没指定/不可识别时用它）
 --mode replace|append|prepend     载荷拼装方式（默认 replace）
+--target system|user|both    注进哪一层（默认 system；user 仅在网关吞 system 时应急）
+--min-tokens 16000           max_tokens 下限，防止长思考把预算烧在 reasoning 上
+--force-model cn:xxx         忽略客户端选择，全部钉到一个模型
+--no-model-pass              等价 WBXC_MODEL_PASSTHROUGH=0：只认 --model
 --dry                        只打印，不写文件
 --no-start                   不自动拉起 bridge
 --no-codex / --no-claude     只接其中一个
@@ -217,9 +235,11 @@ npx wb2-cross revert
 
 ## 已知边界
 
-- **推理型模型会先烧 reasoning token。** 若 `max_tokens` 给小了，正文可能为空。bridge 已做回落：正文空且只有 reasoning 时，把 reasoning 当正文输出，不会给你一片空白。
+- **推理型模型会先烧 reasoning token。** 客户端给的 `max_output_tokens` 常常只有 4k–8k，一段长思考就烧完：`finish_reason=length`、正文为空，客户端表现成"想了一会儿就没动静了"。本版两条兜底：`--min-tokens`（默认 16000，`WBXC_MIN_TOKENS`）把 `max_tokens` 抬到至少这个数；万一仍只拿到 reasoning，就把 reasoning 当正文交出去，并且**只有真没内容时才发** `response.failed`（`empty_output` / `stream_interrupted`），不再假装成功。
+- **长思考要同时过网关两道超时。** `upstream.header_timeout_seconds`（默认 120s，等首字节）与 `idle_timeout_seconds`（默认 300s，等下一个块）。首字节迟迟不来，网关会换号重发，客户端看到的就是"流突然没了"。跑重推理的实例把它调到 300s；bridge 另外每 10s 发一个 SSE 注释心跳（`: ping`），免得中间层把安静的长连接当死连接掐掉。
+- **注入层可切换（`--target system|user|both`，默认 `system`）。** system 是唯一稳的落点：`user` 层注入在**带工具定义**的请求里会被模型判成注入并反驳（实测 codex 回"我叫 Claude，不是 Little Code Sauce"，而同一个探针不带工具时完全配合）。`user` 只作为网关吞 system 时的应急手段。
 - **`replace` 会丢掉客户端原有的系统提示。** Claude Code 丢了之后会答"我是 Claude，Anthropic 开发的模型"——所以 FOOT 里必须锁名字。
-- **网关 `prompt.mode` 是全局的。** 改它是给整条链路换行为：同一网关上的其它客户端（包括 DSH 本身，如果也走 7863）在看到 system 的方式上会被一起改变。`passthrough` 是唯一一个"不干预"的模式，所以它同时也是对别的客户端影响最小的那个。
+- **网关 `prompt.mode` 是按进程生效的。** 改它是给整条链路换行为，而且必须重启才生效；同一网关上的其它客户端（包括 DSH 本身，如果也走 7863）会被一起改变。需要两种行为共存时，再起一个网关实例（见上面"网关已经另有用途怎么办"）。
 - **模型级类别偏置仍在。** 极少数类别（如 LSASS 凭据导出）即使在 `replace` 下也可能被降级成"检测侧建议"。这是模型本身的倾向，不是注入没生效。
 - **Codex TUI 会把最终回复渲染两遍。** 实测本包与 DSH 自带的 bridge 表现一致，属于 codex 客户端渲染行为（SSE 事件序列已核对：只有一组 delta、一个 message item），不影响内容与工具调用。
 - **`/v1/chat/completions` 也支持注入**，方便任何 OpenAI 兼容客户端复用。
@@ -229,12 +249,12 @@ npx wb2-cross revert
 | 现象 | 原因 | 处理 |
 |---|---|---|
 | `doctor` 报上游不可达 | wb2api 没启动 | 先起网关 |
-| 身份探针答"我是 Codex / Claude" | 载荷没到 system 层 | 确认 `prompt.mode=passthrough` 且网关已重启；确认 bridge 在跑（`http://127.0.0.1:7888/healthz`）|
+| 身份探针答"我是 Codex / Claude" | 载荷没到 system 层 | 确认 `prompt.mode=append` **且网关已重启**（`/panel/api/config` 回 `restart_required` 说明还没生效）；确认 bridge 在跑（`http://127.0.0.1:7888/healthz`）|
 | 模型说"检测到提示词注入" | 载荷出现了两次 | 检查是否同时写了 `AGENTS.md`/`CLAUDE.md`；只保留 system 一份 |
 | Codex / Claude 报连不上（connection refused） | bridge 没在跑（重启、休眠恢复后常见） | 跑一次 `powershell -File ~/.wb2-cross/ensure.ps1`；正常情况下登录后会自己起来 |
 | Codex 报 `stream disconnected before completion: stream closed before response.completed` | 上游在流开始后报错（401、网关挂了）。旧版本把 JSON 错误塞进 SSE，客户端只能看到"流断了" | 升级到本版本：现在会发 `response.failed` / `error` 事件带真实原因；同时看 `~/.wb2-cross/bridge.log` 的 `[err]` 行 |
 | Codex 报 `wire_api = "chat" is no longer supported` | 用了旧写法 | 必须 `wire_api="responses"`，本包已默认 |
-| 回复一片空白 | `max_tokens` 太小，全烧在 reasoning | 调大；或确认 bridge 版本含回落逻辑 |
+| 想了一会儿就不输出 / 回复一片空白 | `max_tokens` 太小，全烧在 reasoning；或首字节超 120s 被网关换号 | 升到本版（`--min-tokens` 默认 16000 + reasoning 回落）；看日志 `[resp] done finish=... text=... reason=...`，`finish=length` 就是被截断 |
 | 401，且日志写 `没找到网关 bearer` | 进程由启动项/计划任务拉起，cwd 是 `system32`，cwd 相对路径猜不到 `config.json` | 本版本已修：先读 `~/.wb2-cross/state.json` 里记录的绝对路径，再由 `install` 生成带 `--gateway-config` 的 supervisor |
 
 ## 常驻与自愈

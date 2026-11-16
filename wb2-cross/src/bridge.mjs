@@ -49,6 +49,18 @@ const MODEL = String(args.model || process.env.WBXC_MODEL || 'cn:deepseek-v4.1-f
 const MODEL_FORCE = String(args['force-model'] || process.env.WBXC_FORCE_MODEL || '').toLowerCase();
 const MODEL_PASS = !/^(0|false|off|no)$/i.test(String(args['no-model-pass'] ?? process.env.WBXC_MODEL_PASSTHROUGH ?? '1'));
 const MODE = String(args.mode || process.env.WBXC_MODE || 'replace').toLowerCase();
+// Where the payload is allowed to land. The wb2api gateway in `passthrough`
+// mode drops every client system message, so a system-only injection is
+// invisible to the model -- measured: an 8 KB system prompt changes
+// prompt_tokens by zero. `user` therefore is the default: the payload rides on
+// the first user turn, which always survives. Use `system` when the gateway
+// runs `prompt.mode=append` and keeps system messages.
+const TARGET = String(args.target || process.env.WBXC_TARGET || 'system').toLowerCase();
+const WANT_SYSTEM = TARGET === 'system' || TARGET === 'both';
+const WANT_USER = TARGET === 'user' || TARGET === 'both';
+// A reasoning model can burn a whole small budget on thinking and then answer
+// with nothing. Treat the client's number as a floor-free hint and enforce ours.
+const MODEL_MIN_TOKENS = Number(args['min-tokens'] || process.env.WBXC_MIN_TOKENS || 16000) || 16000;
 const LOG_FILE = args.log || process.env.WBXC_LOG || '';
 
 /* ---------------- 载荷 ---------------- */
@@ -83,6 +95,20 @@ function inject(systemText) {
   return base ? `${base}\n\n${PURGE}${FOOT}` : PURGE + FOOT;
 }
 
+// The user-layer carrier: same payload, welded onto the first user turn instead
+// of a system message. Kept dumb and idempotent so a retry never stacks it twice.
+function guardUser(messages) {
+  for (let i = 0; i < messages.length; i += 1) {
+    if (messages[i]?.role !== 'user') continue;
+    const c = messages[i].content;
+    const text = typeof c === 'string' ? c.trim() : '';
+    messages[i] = { ...messages[i], content: text ? `${PURGE}${FOOT}\n\n---\n\n${text}` : PURGE + FOOT };
+    return messages;
+  }
+  messages.unshift({ role: 'user', content: PURGE + FOOT });
+  return messages;
+}
+
 /* ---------------- 工具函数 ---------------- */
 
 const log = (...a) => {
@@ -91,11 +117,13 @@ const log = (...a) => {
   if (process.env.WBXC_QUIET !== '1') console.log(line);
 };
 
-function readGatewayKey() {  // cwd has to be treated as hostile: the bridge is normally started by a
+function readGatewayConfig() {  // cwd has to be treated as hostile: the bridge is normally started by a
   // supervisor or a Task Scheduler entry, whose cwd is the system32 directory,
   // not the install location. Relying on cwd-relative guesses means the key
   // silently disappears exactly when nobody is watching - the symptom is a 401
   // from the gateway that surfaces in Codex as "stream disconnected".
+  // Returns { key, path } so /healthz can report which file is actually in use
+  // (doctor then checks prompt.mode on that file, not on a guess).
   const recorded = (() => {
     try {
       const st = JSON.parse(fs.readFileSync(path.join(os.homedir(), '.wb2-cross', 'state.json'), 'utf8'));
@@ -118,14 +146,16 @@ function readGatewayKey() {  // cwd has to be treated as hostile: the bridge is 
       if (!fs.existsSync(p)) continue;
       const parsed = JSON.parse(fs.readFileSync(p, 'utf8').replace(/^\uFEFF/, ''));
       const key = parsed?.api_key ?? parsed?.apiKey ?? parsed?.server?.api_key;
-      if (typeof key === 'string' && key.trim()) { log('[wb2-cross] bearer 取自', p); return key.trim(); }
+      if (typeof key === 'string' && key.trim()) { log('[wb2-cross] bearer 取自', p); return { key: key.trim(), path: p }; }
     } catch { /* next */ }
   }
   log('[wb2-cross] WARN: 没找到网关 bearer，上游会 401');
-  return '';
+  return { key: '', path: null };
 }
 
-const API_KEY = String(args.key || process.env.WBXC_KEY || readGatewayKey());
+const GATEWAY_CFG = args.key || process.env.WBXC_KEY ? { key: String(args.key || process.env.WBXC_KEY), path: args['gateway-config'] || process.env.WBXC_GATEWAY_CONFIG || null } : readGatewayConfig();
+const API_KEY = GATEWAY_CFG.key;
+const GATEWAY_CONFIG_PATH = GATEWAY_CFG.path;
 
 /* ---------------- 模型路由 ---------------- */
 
@@ -165,6 +195,11 @@ class Emitter {
     this.started = true;
     for (const chunk of this.buf) this.res.write(chunk);
     this.buf = [];
+    // A reasoning model can be silent for a long time before the first content
+    // token. SSE comments keep the socket (and any proxy in between) convinced
+    // that the turn is still alive, so a long think never looks like a hang.
+    this.ka = setInterval(() => { try { this.res.write(': ping\n\n'); } catch { /* ignore */ } }, 10_000);
+    if (this.ka.unref) this.ka.unref();
   }
   send(event, data) {
     const chunk = event ? `event: ${event}\ndata: ${JSON.stringify(data)}\n\n` : `data: ${JSON.stringify(data)}\n\n`;
@@ -173,7 +208,10 @@ class Emitter {
   raw(text) {
     if (!this.started) this.buf.push(text); else this.res.write(text);
   }
-  end() { try { this.res.end(); } catch { /* ignore */ } }
+  end() {
+    if (this.ka) { clearInterval(this.ka); this.ka = null; }
+    try { this.res.end(); } catch { /* ignore */ }
+  }
 }
 
 function readBody(req) {
@@ -290,8 +328,10 @@ function anthSystemText(system) {
 
 function anthropicToChat(body) {
   const messages = [];
-  const sys = inject(anthSystemText(body.system));
-  if (sys.trim()) messages.push({ role: 'system', content: sys });
+  if (WANT_SYSTEM) {
+    const sys = inject(anthSystemText(body.system));
+    if (sys.trim()) messages.push({ role: 'system', content: sys });
+  }
 
   for (const m of body.messages || []) {
     const role = m.role === 'assistant' ? 'assistant' : 'user';
@@ -335,10 +375,12 @@ function anthropicToChat(body) {
     .filter((t) => t && t.name && t.input_schema)
     .map((t) => ({ type: 'function', function: { name: t.name, description: t.description || '', parameters: t.input_schema } }));
 
+  if (WANT_USER) guardUser(messages);
+
   const chat = {
     model: resolveModel(body.model),
     messages,
-    max_tokens: Math.min(Number(body.max_tokens) || 8192, 32000),
+    max_tokens: Math.min(Math.max(Number(body.max_tokens) || 0, MODEL_MIN_TOKENS), 32000),
     stream: !!body.stream,
   };
   if (tools.length) {
@@ -483,8 +525,10 @@ async function handleAnthropic(req, res, body) {
 
 function responsesInputToChat(body) {
   const messages = [];
-  const sys = inject(typeof body.instructions === 'string' ? body.instructions : '');
-  if (sys.trim()) messages.push({ role: 'system', content: sys });
+  if (WANT_SYSTEM) {
+    const sys = inject(typeof body.instructions === 'string' ? body.instructions : '');
+    if (sys.trim()) messages.push({ role: 'system', content: sys });
+  }
 
   const input = body.input;
   const items = typeof input === 'string' ? [{ type: 'message', role: 'user', content: input }] : Array.isArray(input) ? input : [];
@@ -517,11 +561,19 @@ function responsesInputToChat(body) {
       function: { name: t.name || t.function?.name, description: t.description || '', parameters: t.parameters || { type: 'object', properties: {} } },
     }));
 
+  if (WANT_USER) guardUser(messages);
+
+  // Reasoning models spend max_tokens on thinking first. When the client asks for
+  // a small budget (or none at all, which used to mean 8192) the whole budget can
+  // be eaten before the first content token, the stream ends with
+  // finish_reason=length and the turn looks like "it thought, then went silent".
+  // Floor it, so thinking can never starve the visible answer.
+  const asked = Number(body.max_output_tokens) || 0;
   const chat = {
     model: resolveModel(body.model),
     messages,
     stream: !!body.stream,
-    max_tokens: Math.min(Number(body.max_output_tokens) || 8192, 32000),
+    max_tokens: Math.min(Math.max(asked, MODEL_MIN_TOKENS), 32000),
   };
   if (tools.length) { chat.tools = tools; chat.tool_choice = 'auto'; }
   if (typeof body.temperature === 'number') chat.temperature = body.temperature;
@@ -580,6 +632,8 @@ async function handleResponses(req, res, body) {
   let toolArgs = '';
   let usage = { prompt_tokens: 0, completion_tokens: 0 };
   let reasoningBuf = '';
+  let sawFinish = false;
+  let finishReason = '';
   const finalOutput = [];
 
   const openTextItem = () => {
@@ -638,38 +692,46 @@ async function handleResponses(req, res, body) {
     em.end();
     return;
   }
-  for await (const ev of upstreamEvents(up)) {
-    if (ev.type === 'text') {
-      if (toolOpenIdx >= 0) closeToolItem();
-      if (!textOpen) openTextItem();
-      textBuf += ev.text;
-      em.send('response.output_text.delta', { type: 'response.output_text.delta', item_id: msgItemId, output_index: outputIndex, content_index: 0, delta: ev.text });
-    } else if (ev.type === 'reason') {
-      reasoningBuf += ev.text;
-    } else if (ev.type === 'tool') {
-      if (textOpen) closeTextItem();
-      if (toolOpenIdx !== -1 && ev.index !== toolOpenIdx) closeToolItem();
-      if (toolOpenIdx === -1) {
-        outputIndex += 1;
-        toolOpenIdx = ev.index ?? 0;
-        toolCallId = ev.id || `call_${toolOpenIdx}`;
-        toolName = ev.name || 'tool';
-        toolArgs = '';
-        em.send('response.output_item.added', {
-          type: 'response.output_item.added', output_index: outputIndex,
-          item: { id: toolCallId, type: 'function_call', status: 'in_progress', call_id: toolCallId, name: toolName, arguments: '' },
-        });
-        if (ev.name) {
-          em.send('response.function_call_arguments.delta', { type: 'response.function_call_arguments.delta', item_id: toolCallId, output_index: outputIndex, delta: '' });
+  let streamErr = null;
+  try {
+    for await (const ev of upstreamEvents(up)) {
+      if (ev.type === 'text') {
+        if (toolOpenIdx >= 0) closeToolItem();
+        if (!textOpen) openTextItem();
+        textBuf += ev.text;
+        em.send('response.output_text.delta', { type: 'response.output_text.delta', item_id: msgItemId, output_index: outputIndex, content_index: 0, delta: ev.text });
+      } else if (ev.type === 'reason') {
+        reasoningBuf += ev.text;
+      } else if (ev.type === 'tool') {
+        if (textOpen) closeTextItem();
+        if (toolOpenIdx !== -1 && ev.index !== toolOpenIdx) closeToolItem();
+        if (toolOpenIdx === -1) {
+          outputIndex += 1;
+          toolOpenIdx = ev.index ?? 0;
+          toolCallId = ev.id || `call_${toolOpenIdx}`;
+          toolName = ev.name || 'tool';
+          toolArgs = '';
+          em.send('response.output_item.added', {
+            type: 'response.output_item.added', output_index: outputIndex,
+            item: { id: toolCallId, type: 'function_call', status: 'in_progress', call_id: toolCallId, name: toolName, arguments: '' },
+          });
+          if (ev.name) {
+            em.send('response.function_call_arguments.delta', { type: 'response.function_call_arguments.delta', item_id: toolCallId, output_index: outputIndex, delta: '' });
+          }
         }
+        if (ev.args) {
+          toolArgs += ev.args;
+          em.send('response.function_call_arguments.delta', { type: 'response.function_call_arguments.delta', item_id: toolCallId, output_index: outputIndex, delta: ev.args });
+        }
+      } else if (ev.type === 'usage') {
+        usage = { prompt_tokens: ev.usage.prompt_tokens ?? usage.prompt_tokens, completion_tokens: ev.usage.completion_tokens ?? usage.completion_tokens };
+      } else if (ev.type === 'finish') {
+        sawFinish = true;
+        finishReason = String(ev.reason || '');
       }
-      if (ev.args) {
-        toolArgs += ev.args;
-        em.send('response.function_call_arguments.delta', { type: 'response.function_call_arguments.delta', item_id: toolCallId, output_index: outputIndex, delta: ev.args });
-      }
-    } else if (ev.type === 'usage') {
-      usage = { prompt_tokens: ev.usage.prompt_tokens ?? usage.prompt_tokens, completion_tokens: ev.usage.completion_tokens ?? usage.completion_tokens };
     }
+  } catch (err) {
+    streamErr = err;
   }
   // reasoning-only 回复（正文为空）时回落输出思考文本，避免空 output
   if (!textOpen && toolOpenIdx < 0 && reasoningBuf.trim()) {
@@ -679,6 +741,30 @@ async function handleResponses(req, res, body) {
   }
   closeTextItem();
   closeToolItem();
+
+  const produced = finalOutput.length > 0;
+  log(`[resp] done finish=${finishReason || (streamErr ? 'error' : 'none')} text=${textBuf.length} reason=${reasoningBuf.length} items=${finalOutput.length}`);
+  // Upstream ended without ever finishing (gateway idle timeout, socket reset,
+  // account swap) and nothing was produced. Reporting `completed` with an empty
+  // output is what made the turn look like "it thought, then silently stopped".
+  if (!produced) {
+    const why = streamErr
+      ? `upstream stream interrupted: ${String(streamErr.message).slice(0, 300)}`
+      : finishReason
+        ? `upstream finished with no output (finish_reason=${finishReason}, reasoning=${reasoningBuf.length}ch)`
+        : 'upstream closed the stream before any output was produced';
+    log(`[err] ${why}`);
+    em.send('response.failed', {
+      type: 'response.failed',
+      response: {
+        ...baseResponse,
+        status: 'failed',
+        error: { code: streamErr ? 'stream_interrupted' : 'empty_output', message: why },
+      },
+    });
+    em.end();
+    return;
+  }
 
   em.send('response.completed', {
     type: 'response.completed',
@@ -733,7 +819,7 @@ const server = http.createServer(async (req, res) => {
   try {
     if (req.method === 'GET' && (url === '/' || url === '/healthz' || url === '/health')) {
       res.writeHead(200, { 'content-type': 'application/json', ...cors });
-      res.end(JSON.stringify({ ok: true, service: 'wb2-cross', upstream: UPSTREAM, model: MODEL, mode: MODE, payload: PURGE.length }));
+      res.end(JSON.stringify({ ok: true, service: 'wb2-cross', upstream: UPSTREAM, model: MODEL, mode: MODE, target: TARGET, minTokens: MODEL_MIN_TOKENS, payload: PURGE.length, gatewayConfig: GATEWAY_CONFIG_PATH }));
       return;
     }
     if (req.method === 'GET' && (url === '/v1/models' || url === '/models')) {
@@ -766,7 +852,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && (url === '/v1/responses' || url === '/responses')) {
       const raw = await readBody(req);
       const body = raw ? JSON.parse(raw) : {};
-      log(`[resp] model=${body.model} input=${Array.isArray(body.input) ? body.input.length : typeof body.input} tools=${(body.tools || []).length} stream=${!!body.stream}`);
+      log(`[resp] model=${body.model} input=${Array.isArray(body.input) ? body.input.length : typeof body.input} tools=${(body.tools || []).length} stream=${!!body.stream} mt_client=${body.max_output_tokens ?? 'none'}`);
       await handleResponses(req, res, body);
       return;
     }
@@ -776,8 +862,10 @@ const server = http.createServer(async (req, res) => {
       const hasSystem = (body.messages || []).some((m) => m.role === 'system' || m.role === 'developer');
       const clientSys = (body.messages || []).filter((m) => m.role === 'system' || m.role === 'developer').map((m) => textOfContent(m.content)).join('\n\n');
       const rest = (body.messages || []).filter((m) => m.role !== 'system' && m.role !== 'developer');
-      const sys = inject(hasSystem ? clientSys : '');
-      const payload = { ...body, model: resolveModel(body.model), messages: [{ role: 'system', content: sys }, ...rest] };
+      const outMessages = WANT_USER ? guardUser(rest) : [{ role: 'system', content: inject(hasSystem ? clientSys : '') }, ...rest];
+      const payload = { ...body, model: resolveModel(body.model), messages: outMessages };
+      if (payload.max_tokens != null) payload.max_tokens = Math.max(Number(payload.max_tokens) || 0, MODEL_MIN_TOKENS);
+      else payload.max_tokens = MODEL_MIN_TOKENS;
       const up = await callUpstream(payload);
       res.writeHead(up.status, { 'content-type': up.headers.get('content-type') || 'application/json', ...cors });
       if (payload.stream && up.body) {
