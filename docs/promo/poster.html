@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>workbuddy2everything — 宣传海报</title>
+<style>
+  @page { size: 1240px 1754px; margin: 0; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  :root {
+    --ink: #e9edf7;
+    --muted: #96a0b8;
+    --dim: #5d6780;
+    --bg: #07090e;
+    --cyan: #33e2d1;
+    --amber: #ffb648;
+    --violet: #9084ff;
+    --line: rgba(255,255,255,.09);
+  }
+  html, body { width: 1240px; height: 1754px; }
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: "Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI", system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    position: relative;
+    overflow: hidden;
+  }
+  /* background: dot grid + two glows */
+  .grid {
+    position: absolute; inset: 0;
+    background-image: radial-gradient(rgba(255,255,255,.075) 1px, transparent 1px);
+    background-size: 26px 26px;
+    mask-image: linear-gradient(180deg, rgba(0,0,0,.95), rgba(0,0,0,.35) 55%, rgba(0,0,0,.9));
+  }
+  .glow-a {
+    position: absolute; width: 900px; height: 900px; left: -260px; top: -320px;
+    background: radial-gradient(circle, rgba(51,226,209,.16), transparent 62%);
+  }
+  .glow-b {
+    position: absolute; width: 1000px; height: 1000px; right: -380px; top: 260px;
+    background: radial-gradient(circle, rgba(144,132,255,.15), transparent 64%);
+  }
+  .glow-c {
+    position: absolute; width: 800px; height: 800px; left: 180px; bottom: -420px;
+    background: radial-gradient(circle, rgba(255,182,72,.10), transparent 66%);
+  }
+  .frame { position: absolute; inset: 0; padding: 64px 72px 56px; display: flex; flex-direction: column; }
+  .top-rule { height: 1px; background: linear-gradient(90deg, var(--cyan), rgba(144,132,255,.6), transparent); }
+
+  /* ---------- header ---------- */
+  .eyebrow {
+    display: flex; align-items: center; gap: 14px;
+    font-size: 15px; letter-spacing: .22em; color: var(--muted); text-transform: uppercase;
+    margin: 26px 0 30px;
+  }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--cyan); box-shadow: 0 0 14px var(--cyan); }
+  .eyebrow .sep { color: var(--dim); }
+
+  h1 {
+    font-size: 82px; line-height: 1.06; letter-spacing: -.045em; font-weight: 800; white-space: nowrap;
+    background: linear-gradient(96deg, #ffffff 8%, #b9f5ee 42%, #a99cff 78%);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  .repo { font-family: Consolas, "Cascadia Mono", monospace; font-size: 21px; color: var(--dim); margin-top: 16px; letter-spacing: .02em; }
+  .claim {
+    margin-top: 30px; font-size: 38px; line-height: 1.42; font-weight: 700; color: #f2f5ff;
+    max-width: 1010px;
+  }
+  .claim em { font-style: normal; color: var(--cyan); }
+  .claim .v { color: var(--violet); }
+  .lede { margin-top: 18px; font-size: 19px; line-height: 1.75; color: var(--muted); max-width: 980px; }
+
+  /* ---------- feature cards ---------- */
+  .cards { margin-top: 44px; display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+  .card {
+    position: relative; border: 1px solid var(--line); border-radius: 18px;
+    background: linear-gradient(160deg, rgba(255,255,255,.055), rgba(255,255,255,.012));
+    padding: 26px 26px 24px; overflow: hidden;
+  }
+  .card::after {
+    content: ""; position: absolute; left: 0; top: 0; width: 3px; height: 100%;
+    background: var(--accent, var(--cyan));
+    box-shadow: 0 0 24px var(--accent, var(--cyan));
+  }
+  .card .no {
+    font-family: Consolas, "Cascadia Mono", monospace; font-size: 13px; letter-spacing: .2em;
+    color: var(--accent, var(--cyan)); opacity: .95;
+  }
+  .card h2 { font-size: 30px; margin: 8px 0 6px; letter-spacing: -.01em; }
+  .card .tag { font-size: 13px; letter-spacing: .16em; color: var(--dim); text-transform: uppercase; margin-bottom: 14px; }
+  .card ul { list-style: none; display: flex; flex-direction: column; gap: 9px; }
+  .card li { font-size: 15.5px; line-height: 1.62; color: #c3cbdd; padding-left: 16px; position: relative; }
+  .card li::before {
+    content: ""; position: absolute; left: 0; top: 10px; width: 6px; height: 6px;
+    border-radius: 2px; background: var(--accent, var(--cyan)); opacity: .85;
+  }
+  .card code {
+    font-family: Consolas, "Cascadia Mono", monospace; font-size: 13.5px;
+    background: rgba(255,255,255,.07); border: 1px solid rgba(255,255,255,.08);
+    padding: 1px 6px; border-radius: 5px; color: #eaf6ff;
+  }
+  .c1 { --accent: var(--cyan); }
+  .c2 { --accent: var(--amber); }
+  .c3 { --accent: #4fd08a; }
+  .c4 { --accent: var(--violet); }
+
+  /* ---------- architecture ---------- */
+  .section-label {
+    margin: 46px 0 18px; font-size: 13px; letter-spacing: .26em; color: var(--dim); text-transform: uppercase;
+    display: flex; align-items: center; gap: 14px;
+  }
+  .section-label::after { content: ""; flex: 1; height: 1px; background: var(--line); }
+  .flow { display: grid; grid-template-columns: 1fr 60px 1.12fr 60px 1.05fr 60px 1fr; align-items: stretch; }
+  .node {
+    border: 1px solid var(--line); border-radius: 14px; padding: 18px 16px;
+    background: rgba(255,255,255,.035); text-align: center;
+    display: flex; flex-direction: column; justify-content: center; gap: 7px;
+  }
+  .node .n-title { font-size: 16.5px; font-weight: 700; color: #eef2fb; }
+  .node .n-sub { font-size: 12.5px; color: var(--muted); line-height: 1.5; }
+  .node.hot { border-color: rgba(51,226,209,.45); background: rgba(51,226,209,.075); }
+  .node.hot .n-title { color: #b7fff6; }
+  .node.warm { border-color: rgba(255,182,72,.4); background: rgba(255,182,72,.07); }
+  .node.warm .n-title { color: #ffdca6; }
+  .arrow { display: flex; align-items: center; justify-content: center; color: rgba(255,255,255,.32); font-size: 20px; }
+  .flow-legend { margin-top: 14px; font-size: 13px; color: var(--dim); font-family: Consolas, "Cascadia Mono", monospace; }
+
+  /* ---------- stats ---------- */
+  .stats {
+    margin-top: 38px; display: grid; grid-template-columns: repeat(4, 1fr);
+    border: 1px solid var(--line); border-radius: 16px; overflow: hidden;
+    background: rgba(255,255,255,.03);
+  }
+  .stat { padding: 22px 20px; border-right: 1px solid var(--line); }
+  .stat:last-child { border-right: 0; }
+  .stat .k { font-size: 40px; font-weight: 800; letter-spacing: -.02em; color: #fff; }
+  .stat .k span { font-size: 17px; font-weight: 600; color: var(--muted); margin-left: 4px; }
+  .stat .d { margin-top: 6px; font-size: 13.5px; color: var(--muted); line-height: 1.55; }
+
+  /* ---------- footer ---------- */
+  .spacer { flex: 1; }
+  .code-line {
+    margin-top: 30px; border: 1px solid rgba(51,226,209,.28); border-radius: 12px;
+    background: rgba(51,226,209,.06); padding: 16px 20px;
+    font-family: Consolas, "Cascadia Mono", monospace; font-size: 15.5px; color: #cbfff8;
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  }
+  .code-line .prompt { color: var(--cyan); }
+  .code-line .cmt { color: #6f7d95; font-size: 14px; }
+  .footer {
+    margin-top: 22px; display: flex; align-items: flex-end; justify-content: space-between;
+    border-top: 1px solid var(--line); padding-top: 18px;
+  }
+  .footer .left { font-size: 14px; color: var(--muted); line-height: 1.7; }
+  .footer .left b { color: #e8eefb; font-weight: 700; }
+  .footer .right { font-family: Consolas, "Cascadia Mono", monospace; font-size: 13.5px; color: var(--dim); text-align: right; line-height: 1.7; }
+</style>
+</head>
+<body>
+  <div class="grid"></div>
+  <div class="glow-a"></div>
+  <div class="glow-b"></div>
+  <div class="glow-c"></div>
+
+  <div class="frame">
+    <div class="top-rule"></div>
+
+    <div class="eyebrow">
+      <span class="dot"></span>
+      <span>OPEN SOURCE</span><span class="sep">/</span>
+      <span>MIT</span><span class="sep">/</span>
+      <span>NODE ≥ 18</span><span class="sep">/</span>
+      <span>零依赖</span>
+    </div>
+
+    <h1>workbuddy2everything</h1>
+    <div class="repo">github.com/kangjiazhen/workbuddy2everything</div>
+
+    <div class="claim">
+      一个本地反向代理，同时接管 <em>Codex</em> 与 <span class="v">Claude Code</span>。
+    </div>
+    <div class="lede">
+      不装插件、不改二进制。把 Responses API 与 Anthropic Messages 两种方言翻译成同一个上游，
+      system 层、账号矩阵、权限档位全部在你自己的机器上。
+    </div>
+
+    <div class="cards">
+      <div class="card c1">
+        <div class="no">01</div>
+        <h2>破甲</h2>
+        <div class="tag">System-layer injection</div>
+        <ul>
+          <li>把客户端自带 system 整段替换成你的指令，三种拼装：<code>replace</code> / <code>append</code> / <code>prepend</code></li>
+          <li>Claude Code 的 base prompt 是成体系的反注入规程，实测只有 <code>replace</code> 能过；代价是身份丢失，用尾注锁名字</li>
+          <li>单层原则：同一指令出现两次即自证注入，所以不再写 <code>AGENTS.md</code> / <code>CLAUDE.md</code></li>
+        </ul>
+      </div>
+
+      <div class="card c2">
+        <div class="no">02</div>
+        <h2>账号矩阵</h2>
+        <div class="tag">Account pool</div>
+        <ul>
+          <li>网关侧账号池统一调度：<code>max_in_flight</code> 限流、会话粘性、失败换号，客户端无感</li>
+          <li>出站指纹脱敏，请求头与版本号按账号归位，不串味</li>
+          <li>一个 key 对外，背后是整排账号；加号、停号只动网关配置</li>
+        </ul>
+      </div>
+
+      <div class="card c3">
+        <div class="no">03</div>
+        <h2>免费积分</h2>
+        <div class="tag">Free credits</div>
+        <ul>
+          <li>走账号自带的免费额度，不必给每个客户端单独充值、单独买 key</li>
+          <li>额度耗尽/限流自动转到下一个可用账号，不中断对话</li>
+          <li>本地 <code>127.0.0.1</code> 直连，不经过任何第三方中继</li>
+        </ul>
+      </div>
+
+      <div class="card c4">
+        <div class="no">04</div>
+        <h2>反向代理</h2>
+        <div class="tag">Reverse proxy · two dialects</div>
+        <ul>
+          <li><code>:7888</code> 同时说 Responses（Codex）与 Anthropic Messages（Claude Code / Claude Desktop）</li>
+          <li>SSE 全事件序列自实现：<code>response.failed</code> / <code>error</code> 带真实原因，不再伪装成断流</li>
+          <li><code>/v1/models</code> 透传网关真实目录，选哪个模型就走哪个</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-label">请求链路</div>
+    <div class="flow">
+      <div class="node">
+        <div class="n-title">Codex</div>
+        <div class="n-sub">TUI / 桌面端<br>Responses API</div>
+      </div>
+      <div class="arrow">→</div>
+      <div class="node hot">
+        <div class="n-title">wb2-cross :7888</div>
+        <div class="n-sub">双方言翻译 · system 注入<br>模型路由 · 失败事件</div>
+      </div>
+      <div class="arrow">→</div>
+      <div class="node warm">
+        <div class="n-title">wb2api :7863</div>
+        <div class="n-sub">账号矩阵 · 免费积分<br>指纹脱敏 · 会话粘性</div>
+      </div>
+      <div class="arrow">→</div>
+      <div class="node">
+        <div class="n-title">模型池</div>
+        <div class="n-sub">deepseek · glm · kimi<br>minimax · step · …</div>
+      </div>
+    </div>
+    <div class="flow-legend">Claude Code / Claude Desktop 走同一跳：Anthropic Messages → :7888 → :7863</div>
+
+    <div class="stats">
+      <div class="stat"><div class="k">20<span>个</span></div><div class="d">网关可用模型<br>选择器直接列出</div></div>
+      <div class="stat"><div class="k">2<span>种</span></div><div class="d">协议方言<br>Responses / Anthropic</div></div>
+      <div class="stat"><div class="k">0<span>依赖</span></div><div class="d">只用 Node 内置模块<br>不需要 npm install</div></div>
+      <div class="stat"><div class="k">5<span>秒</span></div><div class="d">进程自愈<br>supervisor + 定时体检</div></div>
+    </div>
+
+    <div class="spacer"></div>
+
+    <div class="code-line">
+      <span class="prompt">$</span>
+      <span>npm i -g wb2-cross && wb2-cross install</span>
+      <span class="cmt"># 写配置、起桥、装自启动，一条命令</span>
+    </div>
+
+    <div class="footer">
+      <div class="left">
+        <b>workbuddy2everything</b> · MIT License<br>
+        本地运行 · 零遥测 · 配置可一键 <b>revert</b>
+      </div>
+      <div class="right">
+        github.com/kangjiazhen/workbuddy2everything<br>
+        wb2-cross/ · doctor · status · revert
+      </div>
+    </div>
+  </div>
+</body>
+</html>

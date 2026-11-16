@@ -1,5 +1,10 @@
 # wb2-cross
 
+<a href="../docs/promo/poster.pdf"><img src="../docs/promo/poster.png" alt="workbuddy2everything 宣传图" width="720"></a>
+
+<sub>宣传图：<a href="../docs/promo/poster.pdf">PDF</a> · <a href="../docs/promo/poster.html">HTML 源</a>（可改字后重新导 PDF）</sub>
+
+
 把 **Codex** 和 **Claude Code** 一起接到本地的 **wb2api 网关**上，并在 **system 层**注入一份统一载荷。
 
 零依赖、单文件 bridge、跨平台、一条命令安装、一条命令回滚。
