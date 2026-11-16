@@ -132,6 +132,30 @@ npx wb2-cross revert      # 还原到安装前
 
 ---
 
+## 选模型
+
+网关背后有十几个模型（`GET http://127.0.0.1:7863/v1/models` 能看到 `cn:deepseek-v4.1-flash`、`cn:glm-5.3`、`cn:kimi-k3.1-pro`、`cn:minimax-m3.1-flash` …）。bridge 的理解规则：
+
+| 客户端发来的 `model` | 实际路由 |
+|---|---|
+| `cn:*` 或 `deepseek…` / `glm…` / `kimi…` / `minimax…` / `mimo…` 等网关认识的 id | **原样透传**，走你选的那个模型 |
+| `claude-*`（Claude Code 的暴露 id） | 映射到默认模型（`--model`，默认 `cn:deepseek-v4.1-flash`） |
+| `gpt-6-sol` / `o3` / 空值 等网关不认识的名字 | 回落到默认模型 |
+| 设了 `--force-model` 或 `WBXC_FORCE_MODEL` | 一律钉到它（旧行为） |
+
+`GET /v1/models` 现在透传网关的真实目录（60 秒缓存）并额外保留 `claude-opus-5-5` 给 Anthropic 客户端，所以 Codex 的模型选择器能列出全部模型。命令行直接换：
+
+```powershell
+codex exec -c model="cn:glm-5.3-flash" "只回答：你是哪个模型"
+codex exec -c model="cn:kimi-k3.1-pro" "只回答：你是哪个模型"
+```
+
+想临时退回"全部一个模型"：把 `--force-model cn:deepseek-v4.1-flash` 加进 supervisor 的参数，或设 `WBXC_MODEL_PASSTHROUGH=0`（此时所有请求都用 `--model`）。
+
+> 透传只改"打到哪个模型"，不改 system 层：载荷注入、`replace` 模式、权限档位对所有模型一视同仁。
+
+---
+
 ## 换载荷
 
 `src/payload.md` 就是要注入的全文。两种改法：

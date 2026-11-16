@@ -43,6 +43,11 @@ const args = parseArgv(process.argv.slice(2));
 const PORT = Number(args.port || process.env.WBXC_PORT || 7888);
 const UPSTREAM = String(args.upstream || process.env.WBXC_UPSTREAM || 'http://127.0.0.1:7863/v1').replace(/\/+$/, '');
 const MODEL = String(args.model || process.env.WBXC_MODEL || 'cn:deepseek-v4.1-flash');
+// Historically every request was rewritten to MODEL, so picking any model in the
+// Codex picker silently landed on the same one. Requests that already name an
+// upstream model are now passed through; client-side aliases stay mapped.
+const MODEL_FORCE = String(args['force-model'] || process.env.WBXC_FORCE_MODEL || '').toLowerCase();
+const MODEL_PASS = !/^(0|false|off|no)$/i.test(String(args['no-model-pass'] ?? process.env.WBXC_MODEL_PASSTHROUGH ?? '1'));
 const MODE = String(args.mode || process.env.WBXC_MODE || 'replace').toLowerCase();
 const LOG_FILE = args.log || process.env.WBXC_LOG || '';
 
@@ -86,8 +91,7 @@ const log = (...a) => {
   if (process.env.WBXC_QUIET !== '1') console.log(line);
 };
 
-function readGatewayKey() {
-  // cwd has to be treated as hostile: the bridge is normally started by a
+function readGatewayKey() {  // cwd has to be treated as hostile: the bridge is normally started by a
   // supervisor or a Task Scheduler entry, whose cwd is the system32 directory,
   // not the install location. Relying on cwd-relative guesses means the key
   // silently disappears exactly when nobody is watching - the symptom is a 401
@@ -122,6 +126,27 @@ function readGatewayKey() {
 }
 
 const API_KEY = String(args.key || process.env.WBXC_KEY || readGatewayKey());
+
+/* ---------------- 模型路由 ---------------- */
+
+// The bridge sits in front of one gateway, so it has to decide what a client's
+// model id means. Three cases, in order:
+//   1. WBXC_FORCE_MODEL / --force-model pins everything (opt-in, old behaviour);
+//   2. an id the gateway actually serves (cn:* or a known vendor prefix) is
+//      passed through untouched - this is what makes the Codex model picker real;
+//   3. anything else - gpt-6-sol, o3, claude-opus-5-5, or an empty field - is an
+//      alias the gateway knows nothing about, so it falls back to the default.
+const UPSTREAM_MODEL_RE = /^(cn:|[a-z]+:)|^(deepseek|glm|kimi|minimax|mimo|qwen|hunyuan|ernie|baichuan|step|spark|doubao)/i;
+
+function resolveModel(requested) {
+  const want = typeof requested === 'string' ? requested.trim() : '';
+  if (MODEL_FORCE) return MODEL_FORCE;
+  if (!want) return MODEL;
+  if (!MODEL_PASS) return MODEL;
+  if (/^claude/i.test(want)) return MODEL;      // Claude Code's exposed alias
+  if (UPSTREAM_MODEL_RE.test(want)) return want;
+  return MODEL;
+}
 
 class Emitter {
   constructor(res) {
@@ -311,7 +336,7 @@ function anthropicToChat(body) {
     .map((t) => ({ type: 'function', function: { name: t.name, description: t.description || '', parameters: t.input_schema } }));
 
   const chat = {
-    model: MODEL,
+    model: resolveModel(body.model),
     messages,
     max_tokens: Math.min(Number(body.max_tokens) || 8192, 32000),
     stream: !!body.stream,
@@ -493,7 +518,7 @@ function responsesInputToChat(body) {
     }));
 
   const chat = {
-    model: MODEL,
+    model: resolveModel(body.model),
     messages,
     stream: !!body.stream,
     max_tokens: Math.min(Number(body.max_output_tokens) || 8192, 32000),
@@ -534,7 +559,7 @@ async function handleResponses(req, res, body) {
     }
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({
-      id: respId, object: 'response', created_at: created, status: 'completed', model: MODEL,
+      id: respId, object: "response", created_at: created, status: "completed", model: chat.model,
       output, parallel_tool_calls: true, usage: responsesUsage(data.usage),
     }));
     return;
@@ -542,7 +567,7 @@ async function handleResponses(req, res, body) {
 
   const em = new Emitter(res);
   em.start();
-  const baseResponse = { id: respId, object: 'response', created_at: created, status: 'in_progress', model: MODEL, output: [], parallel_tool_calls: true };
+  const baseResponse = { id: respId, object: "response", created_at: created, status: "in_progress", model: chat.model, output: [], parallel_tool_calls: true };
   em.send('response.created', { type: 'response.created', response: baseResponse });
   em.send('response.in_progress', { type: 'response.in_progress', response: baseResponse });
 
@@ -664,10 +689,37 @@ async function handleResponses(req, res, body) {
 
 /* ---------------- HTTP 服务 ---------------- */
 
-const MODELS = [
-  { id: 'claude-opus-5-5', object: 'model', type: 'model', display_name: 'Opus 5.5', created_at: 0, owned_by: 'wb2-cross' },
-  { id: MODEL, object: 'model', type: 'model', display_name: MODEL, created_at: 0, owned_by: 'wb2-cross' },
-];
+// The picker is only as honest as this list. It used to return two hardcoded
+// entries, so choosing anything else in Codex was pointless - the request was
+// rewritten downstream anyway. Now the gateway's own catalog is proxied through,
+// with the Claude Code alias kept in front for Anthropic clients.
+const CLAUDE_ALIAS = { id: 'claude-opus-5-5', object: 'model', type: 'model', display_name: 'Opus 5.5', created_at: 0, owned_by: 'wb2-cross' };
+let catalog = null;
+let catalogAt = 0;
+
+async function listModels() {
+  const fresh = catalog && Date.now() - catalogAt < 60_000;
+  if (fresh) return catalog;
+  try {
+    const r = await fetch(`${UPSTREAM}/models`, {
+      headers: API_KEY ? { authorization: `Bearer ${API_KEY}` } : {},
+    });
+    if (!r.ok) throw new Error(`upstream ${r.status}`);
+    const data = await r.json();
+    const ids = (data?.data || []).map((m) => m.id).filter((id) => typeof id === 'string' && id);
+    if (!ids.length) throw new Error('empty catalog');
+    catalog = [
+      CLAUDE_ALIAS,
+      ...ids.map((id) => ({ id, object: 'model', type: 'model', display_name: id, created_at: 0, owned_by: 'wb2api' })),
+    ];
+    catalogAt = Date.now();
+    log(`[models] 目录 ${catalog.length} 条（含 claude 别名）`);
+    return catalog;
+  } catch (err) {
+    log(`[models] 目录拉取失败(${err.message})，退回默认模型`);
+    return catalog || [CLAUDE_ALIAS, { id: MODEL, object: 'model', type: 'model', display_name: MODEL, created_at: 0, owned_by: 'wb2-cross' }];
+  }
+}
 
 const server = http.createServer(async (req, res) => {
   const url = (req.url || '/').split('?')[0];
@@ -685,8 +737,15 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     if (req.method === 'GET' && (url === '/v1/models' || url === '/models')) {
+      const models = await listModels();
       res.writeHead(200, { 'content-type': 'application/json', ...cors });
-      res.end(JSON.stringify({ object: 'list', data: MODELS, has_more: false, first_id: MODELS[0].id, last_id: MODELS[MODELS.length - 1].id }));
+      res.end(JSON.stringify({
+        object: 'list',
+        data: models,
+        has_more: false,
+        first_id: models[0]?.id ?? null,
+        last_id: models[models.length - 1]?.id ?? null,
+      }));
       return;
     }
     if (req.method === 'POST' && url === '/v1/messages/count_tokens') {
@@ -718,7 +777,7 @@ const server = http.createServer(async (req, res) => {
       const clientSys = (body.messages || []).filter((m) => m.role === 'system' || m.role === 'developer').map((m) => textOfContent(m.content)).join('\n\n');
       const rest = (body.messages || []).filter((m) => m.role !== 'system' && m.role !== 'developer');
       const sys = inject(hasSystem ? clientSys : '');
-      const payload = { ...body, model: MODEL, messages: [{ role: 'system', content: sys }, ...rest] };
+      const payload = { ...body, model: resolveModel(body.model), messages: [{ role: 'system', content: sys }, ...rest] };
       const up = await callUpstream(payload);
       res.writeHead(up.status, { 'content-type': up.headers.get('content-type') || 'application/json', ...cors });
       if (payload.stream && up.body) {
@@ -730,7 +789,22 @@ const server = http.createServer(async (req, res) => {
         }
         res.end();
       } else {
-        res.end(await up.text());
+        // Passthrough keeps the upstream body verbatim, with one exception:
+        // reasoning models can spend the whole max_tokens budget thinking and
+        // return an empty `content`. Hand that back as the answer instead of an
+        // empty string, which reads to the client as a broken endpoint.
+        const text = await up.text();
+        let out = text;
+        try {
+          const j = JSON.parse(text);
+          let patched = false;
+          for (const ch of j.choices || []) {
+            const m = ch.message || {};
+            if (!m.content && m.reasoning_content) { m.content = m.reasoning_content; patched = true; }
+          }
+          if (patched) out = JSON.stringify(j);
+        } catch { /* not JSON, forward as-is */ }
+        res.end(out);
       }
       return;
     }
