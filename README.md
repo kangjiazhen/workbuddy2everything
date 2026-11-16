@@ -342,6 +342,9 @@ Set it a little **above** the real ceiling (`1200000` for a `1048576`-token upst
 
 ## Without DSH: `wb2-cross`
 
+> Shipped as its own repo now: **https://github.com/kangjiazhen/wb2-cross** — clone, 
+ode src/cli.mjs install --upstream ... --api-key ..., done. The copy in `wb2-cross/` stays for reference.
+
 This repository is a DSH plugin, so using it presupposes DSH. [`wb2-cross/`](wb2-cross/README.md) is the **standalone** build of the same request translation: zero dependencies, one bridge file, one command to install, one command to roll back — no DSH, no plugin, and no binary patching.
 
 It solves the same client-side problems as the plugin, just anchored elsewhere:
