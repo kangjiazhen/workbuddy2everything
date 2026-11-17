@@ -124,6 +124,14 @@ function readGatewayConfig() {  // cwd has to be treated as hostile: the bridge 
   // from the gateway that surfaces in Codex as "stream disconnected".
   // Returns { key, path } so /healthz can report which file is actually in use
   // (doctor then checks prompt.mode on that file, not on a guess).
+  // 远程上游（api.deepseek.com 之类）不走 config.json，key 从环境变量来。
+  const envKey = (() => {
+    for (const k of ['WBXC_API_KEY', 'DEEPSEEK_API_KEY', 'OPENAI_API_KEY', 'MOONSHOT_API_KEY', 'DASHSCOPE_API_KEY']) {
+      const v = process.env[k];
+      if (typeof v === 'string' && v.trim()) return { key: v.trim(), path: null };
+    }
+    return null;
+  })();
   const recorded = (() => {
     try {
       const st = JSON.parse(fs.readFileSync(path.join(os.homedir(), '.wb2-cross', 'state.json'), 'utf8'));
@@ -149,7 +157,8 @@ function readGatewayConfig() {  // cwd has to be treated as hostile: the bridge 
       if (typeof key === 'string' && key.trim()) { log('[wb2-cross] bearer 取自', p); return { key: key.trim(), path: p }; }
     } catch { /* next */ }
   }
-  log('[wb2-cross] WARN: 没找到网关 bearer，上游会 401');
+  if (envKey) { log('[wb2-cross] bearer 取自环境变量'); return envKey; }
+  log('[wb2-cross] WARN: 没找到上游 key（--key / WBXC_API_KEY / DEEPSEEK_API_KEY / 网关 config.json），上游会 401');
   return { key: '', path: null };
 }
 
@@ -317,6 +326,37 @@ async function* upstreamEvents(res) {
   yield { type: 'eof' };
 }
 
+/**
+ * Buffer one upstream answer before translating it. A Responses stream cannot
+ * retract deltas that were already sent, so retrying after a partial answer
+ * would otherwise produce a corrupted message (half of attempt 1 + attempt 2).
+ * Two fresh attempts are made; only a complete answer is replayed to the client.
+ */
+async function collectUpstream(chat, label) {
+  const maxAttempts = 2;
+  let lastEvents = [];
+  let lastError = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const events = [];
+    let sawFinish = false;
+    try {
+      const up = await callUpstream(chat);
+      for await (const ev of upstreamEvents(up)) {
+        events.push(ev);
+        if (ev.type === 'finish') sawFinish = true;
+      }
+      if (sawFinish) return { events, error: null };
+      lastError = new Error('upstream closed the stream before finish_reason; the answer is incomplete');
+    } catch (err) {
+      lastError = err;
+    }
+    lastEvents = events;
+    log(`[${label}] incomplete upstream answer, attempt ${attempt}/${maxAttempts}: ${String(lastError.message).slice(0, 240)}`);
+    if (attempt < maxAttempts) await new Promise((r) => setTimeout(r, 400));
+  }
+  return { events: lastEvents, error: lastError || new Error('upstream answer incomplete') };
+}
+
 /* ---------------- Anthropic /v1/messages ---------------- */
 
 function anthSystemText(system) {
@@ -466,25 +506,8 @@ async function handleAnthropic(req, res, body) {
     blockKind = null;
   };
 
-  let up;
-  try {
-    up = await callUpstream(chat);
-  } catch (err) {
-    // Same reasoning as handleResponses: message_start already went out, so a
-    // JSON status code is impossible. Anthropic clients understand an `error`
-    // event mid-stream; without it Claude Code reports a bare connection loss.
-    log(`[err] ${err.message}`);
-    em.send('error', {
-      type: 'error',
-      error: {
-        type: err.status === 401 ? 'authentication_error' : 'api_error',
-        message: String(err.message).slice(0, 600),
-      },
-    });
-    em.end();
-    return;
-  }
-  for await (const ev of upstreamEvents(up)) {
+  const collected = await collectUpstream(chat, 'anth');
+  for (const ev of collected.events) {
     if (ev.type === 'text') {
       sawText = true;
       if (blockKind !== 'text') { closeBlock(); openBlock('text'); }
@@ -504,6 +527,15 @@ async function handleAnthropic(req, res, body) {
     } else if (ev.type === 'finish') {
       finishReason = ev.reason;
     }
+  }
+  if (collected.error) {
+    log(`[err] ${collected.error.message}`);
+    em.send('error', {
+      type: 'error',
+      error: { type: collected.error.status === 401 ? 'authentication_error' : 'api_error', message: String(collected.error.message).slice(0, 600) },
+    });
+    em.end();
+    return;
   }
   closeBlock();
   // 推理型模型可能把 max_tokens 全烧在 reasoning 上、正文为空；此时回落输出思考文本，避免空回复
@@ -543,7 +575,7 @@ function responsesInputToChat(body) {
       messages.push({
         role: 'assistant',
         content: null,
-        tool_calls: [{ id: item.call_id, type: 'function', function: { name: item.name, arguments: item.arguments || '{}' } }],
+        tool_calls: [{ id: item.call_id, type: 'function', function: { name: item.name, arguments: item.type === 'custom_tool_call' ? JSON.stringify({ input: item.input ?? item.arguments ?? '' }) : item.arguments || '{}' } }],
       });
       continue;
     }
@@ -555,11 +587,22 @@ function responsesInputToChat(body) {
   }
 
   const tools = (body.tools || [])
-    .filter((t) => t && (t.type === 'function' || t.name))
-    .map((t) => ({
+    .filter((t) => t && (t.type === 'function' || t.type === 'custom' || t.name))
+    .map((t) => t.type === 'custom' ? {
+      type: 'function',
+      function: {
+        name: t.name,
+        description: `${t.description || ''}\n\nCall this tool with a single "input" string argument containing the raw text payload.`,
+        parameters: {
+          type: 'object',
+          properties: { input: { type: 'string', description: 'Raw text payload.' } },
+          required: ['input'],
+        },
+      },
+    } : {
       type: 'function',
       function: { name: t.name || t.function?.name, description: t.description || '', parameters: t.parameters || { type: 'object', properties: {} } },
-    }));
+    });
 
   if (WANT_USER) guardUser(messages);
 
@@ -630,6 +673,16 @@ async function handleResponses(req, res, body) {
   let toolCallId = null;
   let toolName = null;
   let toolArgs = '';
+  let toolCustom = false;
+  const customToolNames = new Set((body.tools || []).filter((t) => t?.type === 'custom' && t.name).map((t) => t.name));
+  const decodeToolArgs = () => {
+    if (!toolCustom) return toolArgs || '{}';
+    if (!toolArgs) return '{}';
+    try {
+      const parsed = JSON.parse(toolArgs);
+      return typeof parsed.input === 'string' ? parsed.input : toolArgs;
+    } catch { return toolArgs; }
+  };
   let usage = { prompt_tokens: 0, completion_tokens: 0 };
   let reasoningBuf = '';
   let sawFinish = false;
@@ -662,39 +715,24 @@ async function handleResponses(req, res, body) {
   };
   const closeToolItem = () => {
     if (toolOpenIdx < 0) return;
-    em.send('response.function_call_arguments.done', { type: 'response.function_call_arguments.done', item_id: toolCallId, output_index: outputIndex, arguments: toolArgs });
-    const item = { id: toolCallId, type: 'function_call', status: 'completed', call_id: toolCallId, name: toolName, arguments: toolArgs || '{}' };
+    const rawArgs = decodeToolArgs();
+    if (toolCustom) {
+      em.send('response.custom_tool_call_input.done', { type: 'response.custom_tool_call_input.done', item_id: toolCallId, output_index: outputIndex, input: rawArgs });
+      const item = { id: toolCallId, type: 'custom_tool_call', status: 'completed', call_id: toolCallId, name: toolName, input: rawArgs };
+      em.send('response.output_item.done', { type: 'response.output_item.done', output_index: outputIndex, item });
+      finalOutput.push(item);
+      toolOpenIdx = -1;
+      return;
+    }
+    em.send('response.function_call_arguments.done', { type: 'response.function_call_arguments.done', item_id: toolCallId, output_index: outputIndex, arguments: rawArgs });
+    const item = { id: toolCallId, type: 'function_call', status: 'completed', call_id: toolCallId, name: toolName, arguments: rawArgs };
     em.send('response.output_item.done', { type: 'response.output_item.done', output_index: outputIndex, item });
     finalOutput.push(item);
     toolOpenIdx = -1;
   };
 
-  let up;
-  try {
-    up = await callUpstream(chat);
-  } catch (err) {
-    // SSE headers are already out, so the outer handler cannot answer with a
-    // JSON status any more: the client would only ever see "stream closed
-    // before response.completed" and report a generic network fault. Emit the
-    // documented failure event instead so 401 / gateway-down reach the user.
-    log(`[err] ${err.message}`);
-    em.send('response.failed', {
-      type: 'response.failed',
-      response: {
-        ...baseResponse,
-        status: 'failed',
-        error: {
-          code: err.status === 401 ? 'invalid_api_key' : 'upstream_error',
-          message: String(err.message).slice(0, 600),
-        },
-      },
-    });
-    em.end();
-    return;
-  }
-  let streamErr = null;
-  try {
-    for await (const ev of upstreamEvents(up)) {
+  const collected = await collectUpstream(chat, 'resp');
+  for (const ev of collected.events) {
       if (ev.type === 'text') {
         if (toolOpenIdx >= 0) closeToolItem();
         if (!textOpen) openTextItem();
@@ -711,27 +749,41 @@ async function handleResponses(req, res, body) {
           toolCallId = ev.id || `call_${toolOpenIdx}`;
           toolName = ev.name || 'tool';
           toolArgs = '';
+          toolCustom = customToolNames.has(toolName);
           em.send('response.output_item.added', {
             type: 'response.output_item.added', output_index: outputIndex,
-            item: { id: toolCallId, type: 'function_call', status: 'in_progress', call_id: toolCallId, name: toolName, arguments: '' },
+            item: toolCustom
+              ? { id: toolCallId, type: 'custom_tool_call', status: 'in_progress', call_id: toolCallId, name: toolName, input: '' }
+              : { id: toolCallId, type: 'function_call', status: 'in_progress', call_id: toolCallId, name: toolName, arguments: '' },
           });
-          if (ev.name) {
+          if (ev.name && !toolCustom) {
             em.send('response.function_call_arguments.delta', { type: 'response.function_call_arguments.delta', item_id: toolCallId, output_index: outputIndex, delta: '' });
           }
         }
-        if (ev.args) {
-          toolArgs += ev.args;
-          em.send('response.function_call_arguments.delta', { type: 'response.function_call_arguments.delta', item_id: toolCallId, output_index: outputIndex, delta: ev.args });
-        }
+        if (ev.args) toolArgs += ev.args;
       } else if (ev.type === 'usage') {
         usage = { prompt_tokens: ev.usage.prompt_tokens ?? usage.prompt_tokens, completion_tokens: ev.usage.completion_tokens ?? usage.completion_tokens };
       } else if (ev.type === 'finish') {
         sawFinish = true;
         finishReason = String(ev.reason || '');
       }
-    }
-  } catch (err) {
-    streamErr = err;
+  }
+  // A missing finish_reason means the upstream connection ended in the middle
+  // of the answer. Never close those items as completed: Codex would stop after
+  // the visible half without telling the user that the answer is incomplete.
+  if (collected.error) {
+    const why = `upstream stream interrupted after retry: ${String(collected.error.message).slice(0, 300)}`;
+    log(`[err] ${why}`);
+    em.send('response.failed', {
+      type: 'response.failed',
+      response: {
+        ...baseResponse,
+        status: 'failed',
+        error: { code: collected.error.status === 401 ? 'invalid_api_key' : 'stream_interrupted', message: why },
+      },
+    });
+    em.end();
+    return;
   }
   // reasoning-only 回复（正文为空）时回落输出思考文本，避免空 output
   if (!textOpen && toolOpenIdx < 0 && reasoningBuf.trim()) {
@@ -743,23 +795,21 @@ async function handleResponses(req, res, body) {
   closeToolItem();
 
   const produced = finalOutput.length > 0;
-  log(`[resp] done finish=${finishReason || (streamErr ? 'error' : 'none')} text=${textBuf.length} reason=${reasoningBuf.length} items=${finalOutput.length}`);
+  log(`[resp] done finish=${finishReason || 'none'} text=${textBuf.length} reason=${reasoningBuf.length} items=${finalOutput.length}`);
   // Upstream ended without ever finishing (gateway idle timeout, socket reset,
   // account swap) and nothing was produced. Reporting `completed` with an empty
   // output is what made the turn look like "it thought, then silently stopped".
   if (!produced) {
-    const why = streamErr
-      ? `upstream stream interrupted: ${String(streamErr.message).slice(0, 300)}`
-      : finishReason
-        ? `upstream finished with no output (finish_reason=${finishReason}, reasoning=${reasoningBuf.length}ch)`
-        : 'upstream closed the stream before any output was produced';
+    const why = finishReason
+      ? `upstream finished with no output (finish_reason=${finishReason}, reasoning=${reasoningBuf.length}ch)`
+      : 'upstream closed the stream before any output was produced';
     log(`[err] ${why}`);
     em.send('response.failed', {
       type: 'response.failed',
       response: {
         ...baseResponse,
         status: 'failed',
-        error: { code: streamErr ? 'stream_interrupted' : 'empty_output', message: why },
+        error: { code: 'empty_output', message: why },
       },
     });
     em.end();
